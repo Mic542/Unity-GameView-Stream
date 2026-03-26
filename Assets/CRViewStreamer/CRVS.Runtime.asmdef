@@ -1,0 +1,16 @@
+{
+    "name": "CRVS.Runtime",
+    "rootNamespace": "",
+    "references": [
+        "GUID:4d14b15ded5e3ac4499a81ec3fc340fc"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

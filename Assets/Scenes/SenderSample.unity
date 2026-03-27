@@ -321,11 +321,12 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 216d067e25ddf164e995db18e8865a44, type: 3}
   m_Name: 
   m_EditorClassIdentifier: CRVS.Runtime::GameViewStream.ViewEncoder
-  autoDiscover: 1
+  autoDiscover: 0
   discoveryPort: 9001
   discoveryTimeout: 5000
   serverAddress: 127.0.0.1
   serverPort: 9000
+  manualTransportMode: 0
   captureWidth: 640
   captureHeight: 480
   targetFPS: 30
@@ -335,6 +336,9 @@ MonoBehaviour:
   sendQueueCapacity: 2
   codecMode: 0
   h264BitrateMbps: 1
+  sendReliable: 0
+  retransmitMs: 20
+  maxRetries: 10
 --- !u!1 &1593653858
 GameObject:
   m_ObjectHideFlags: 0

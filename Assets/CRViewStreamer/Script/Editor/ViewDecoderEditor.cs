@@ -23,25 +23,26 @@ namespace GameViewStream
             // ── Decode Settings ──────────────────────────────────────────────────
             Header("Decode Settings");
             EditorGUILayout.PropertyField(Prop("maxDecodePerFrame"));
-            EditorGUILayout.PropertyField(Prop("destroyDisplayOnDisconnect"));
+
+            // Read codecMode early so we can use it in Performance and Codec sections
+            var codecModeProp = Prop("codecMode");
 
             // ── Performance ──────────────────────────────────────────────────────
             Header("Performance");
-            EditorGUILayout.PropertyField(Prop("decodeWorkerCount"));
+            bool isH264 = codecModeProp.enumValueIndex == (int)CodecMode.H264;
+            using (new EditorGUI.DisabledScope(isH264))
+            {
+                EditorGUILayout.PropertyField(Prop("decodeWorkerCount"));
+                if (isH264)
+                    EditorGUILayout.HelpBox("H.264 requires strictly sequential NAL feeding — worker count is forced to 1 at runtime.", MessageType.Info);
+            }
             EditorGUILayout.PropertyField(Prop("readyQueueCap"));
 
-            // ── Codec ─────────────────────────────────────────────────────────────
+            // ── Codec ───────────────────────────────────────────────────────────
             Header("Codec");
-            var codecModeProp = Prop("codecMode");
             EditorGUILayout.PropertyField(codecModeProp, new GUIContent("Codec Mode"));
-
-            if (codecModeProp.enumValueIndex == (int)CodecMode.H264)
-            {
-                EditorGUI.indentLevel++;
-                EditorGUILayout.PropertyField(Prop("h264StreamWidth"),  new GUIContent("Stream Width"));
-                EditorGUILayout.PropertyField(Prop("h264StreamHeight"), new GUIContent("Stream Height"));
-                EditorGUI.indentLevel--;
-            }
+            // if (isH264)
+            //     EditorGUILayout.HelpBox("Stream resolution is detected automatically from the H.264 SPS header — no manual width/height needed.", MessageType.Info);
 
             // ── Debug ─────────────────────────────────────────────────────────────
             Header("Debug (read-only)");

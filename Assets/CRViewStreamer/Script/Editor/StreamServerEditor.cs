@@ -30,8 +30,9 @@ namespace GameViewStream
 
             // ── Connection ───────────────────────────────────────────────────────
             Header("Connection");
-            EditorGUILayout.PropertyField(Prop("clientTimeout"),  new GUIContent("Client Timeout (s)"));
-            EditorGUILayout.PropertyField(Prop("frameQueueCap"),  new GUIContent("Frame Queue Cap"));
+            EditorGUILayout.PropertyField(Prop("heartbeatInterval"), new GUIContent("Heartbeat Interval (s)"));
+            EditorGUILayout.PropertyField(Prop("heartbeatTimeout"),  new GUIContent("Heartbeat Timeout (s)"));
+            EditorGUILayout.PropertyField(Prop("frameQueueCap"),     new GUIContent("Frame Queue Cap"));
 
             // ── Debug ─────────────────────────────────────────────────────────────
             Header("Debug (read-only)");

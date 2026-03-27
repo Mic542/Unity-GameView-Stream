@@ -7,8 +7,7 @@
 // Design:
 //   * One H264Decoder instance per connected client (managed by ViewDecoder).
 //   * NOT thread-safe for concurrent calls - callers must lock externally.
-//   * Fragment reassembly runs here before calling Decode.
-//   * IDisposable: releases native decoder and any pooled fragment buffers.
+//   * IDisposable: releases native decoder.
 
 using System;
 using System.Buffers;
@@ -90,21 +89,6 @@ namespace GameViewStream
         private GCHandle _stagePin;
         private bool     _stagePinned = false;
 
-        // == Fragment reassembly =======================================================
-
-        private sealed class FragmentBuffer
-        {
-            public uint   FrameId;
-            public byte[] Data;
-            public int    TotalBytes;
-            public bool[] ReceivedFlags;
-            public int    ReceivedCount;
-            public int    TotalFragments;
-            public long   LastUpdateMs;
-        }
-
-        private FragmentBuffer _fragBuffer;
-
         // == Properties ================================================================
 
         public int  Width   { get; private set; }
@@ -142,72 +126,6 @@ namespace GameViewStream
             _stagePin    = GCHandle.Alloc(_stageBuf, GCHandleType.Pinned);
             _stagePinned = true;
             return true;
-        }
-
-        // == Fragment reassembly =======================================================
-
-        private static long NowMs =>
-            System.Diagnostics.Stopwatch.GetTimestamp() * 1000L
-            / System.Diagnostics.Stopwatch.Frequency;
-
-        /// <summary>
-        /// Feed one H264Fragment packet payload.  Returns a rented RGBA32 ArrayPool buffer
-        /// when the last fragment completes the frame; otherwise null.
-        /// Caller MUST return the buffer to ArrayPool(byte).Shared when done.
-        /// </summary>
-        public byte[] FeedFragment(byte[] payload, int payloadLength, uint frameId)
-        {
-            if (!IsReady) return null;
-            if (payloadLength < NetworkProtocol.FragSubHeaderSize) return null;
-
-            byte fragIdx   = payload[0];
-            byte fragTotal = payload[1];
-            if (fragTotal == 0) return null;
-
-            if (_fragBuffer == null
-                || _fragBuffer.FrameId != frameId
-                || (NowMs - _fragBuffer.LastUpdateMs) > 2000)
-            {
-                // Return the old fragment buffer's rented array before replacing it.
-                // Without this, switching to a new frameId (or timeout) leaks the pooled array.
-                if (_fragBuffer?.Data != null)
-                    ArrayPool<byte>.Shared.Return(_fragBuffer.Data);
-
-                _fragBuffer = new FragmentBuffer
-                {
-                    FrameId        = frameId,
-                    Data           = ArrayPool<byte>.Shared.Rent(fragTotal * NetworkProtocol.MaxH264ChunkSize),
-                    TotalBytes     = 0,
-                    ReceivedFlags  = new bool[fragTotal],
-                    ReceivedCount  = 0,
-                    TotalFragments = fragTotal,
-                    LastUpdateMs   = NowMs,
-                };
-            }
-
-            _fragBuffer.LastUpdateMs = NowMs;
-            if (fragIdx >= _fragBuffer.TotalFragments) return null;
-
-            int chunkSize  = payloadLength - NetworkProtocol.FragSubHeaderSize;
-            int destOffset = fragIdx * NetworkProtocol.MaxH264ChunkSize;
-            if (destOffset + chunkSize > _fragBuffer.Data.Length) return null;
-
-            Buffer.BlockCopy(payload, NetworkProtocol.FragSubHeaderSize,
-                             _fragBuffer.Data, destOffset, chunkSize);
-
-            if (!_fragBuffer.ReceivedFlags[fragIdx])
-            {
-                _fragBuffer.ReceivedFlags[fragIdx] = true;
-                _fragBuffer.ReceivedCount++;
-                _fragBuffer.TotalBytes = Math.Max(_fragBuffer.TotalBytes, destOffset + chunkSize);
-            }
-
-            if (_fragBuffer.ReceivedCount < _fragBuffer.TotalFragments) return null;
-
-            byte[] rgba = Decode(_fragBuffer.Data, 0, _fragBuffer.TotalBytes);
-            ArrayPool<byte>.Shared.Return(_fragBuffer.Data);
-            _fragBuffer = null;
-            return rgba;
         }
 
         // == Decode ====================================================================
@@ -284,9 +202,6 @@ namespace GameViewStream
                 _id = -1;
             }
 
-            if (_fragBuffer?.Data != null)
-                ArrayPool<byte>.Shared.Return(_fragBuffer.Data);
-            _fragBuffer = null;
         }
     }
 
@@ -299,7 +214,6 @@ namespace GameViewStream
         public int  Height   { get; private set; }
         public bool Initialize(int w, int h)                           => false;
         public byte[] Decode(byte[] d, int o, int l)                   => null;
-        public byte[] FeedFragment(byte[] p, int pl, uint fid)         => null;
         public void Dispose() { }
     }
 #endif

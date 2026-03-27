@@ -39,13 +39,18 @@ namespace GameViewStream
 
         [Tooltip("StreamServer to read frames from. Leave empty to auto-find on this GameObject.")]
         [SerializeField] private StreamServer server;
+        /// <summary>StreamServer this decoder reads from. Set before the component is enabled.</summary>
+        public StreamServer Server { get => server; set => server = value; }
 
         [Tooltip("RawImage this decoder paints frames onto. Can also be set at runtime via RegisterClient().")]
         [SerializeField] private RawImage display;
+        /// <summary>RawImage this decoder paints frames onto. Can be set before enabling or via RegisterClient().</summary>
+        public RawImage Display { get => display; set => display = value; }
         [Tooltip("Client ID this decoder is bound to when using the Inspector display.\n"
                + "Set to 0 to automatically claim the next connecting client.")]
         [SerializeField] private ushort boundClientId = 0;
-        public ushort ClientId => boundClientId;
+        /// <summary>Client ID this decoder is bound to. Set to 0 for auto-claim. Can be set at runtime before enabling.</summary>
+        public ushort ClientId { get => boundClientId; set => boundClientId = value; }
 
         [Tooltip("Max frames to decode per Update tick. Applies to both MJPEG and H264 paths.")]
         [SerializeField, Range(1, 60)] private int maxDecodePerFrame = 16;
@@ -60,12 +65,11 @@ namespace GameViewStream
 
         [Tooltip("Choose the codec used by the streaming client.\n"
                + "MJPEG: CPU decode via TurboJpeg. Low latency but much higher bandwidth usage.\n"
-               + "H264: Hardware decode via GVSTDecoder (any GPU vendor, Windows only).")]
+               + "H264: Hardware decode via GVSTDecoder (any GPU vendor, Windows only).\n"
+               + "H.264 stream resolution is detected automatically from the SPS header.")]
         [SerializeField] private CodecMode codecMode = CodecMode.MJPEG;
-        [Tooltip("Expected width of H.264 stream. Must match ViewEncoder.captureWidth on the client.")]
-        [SerializeField] private int h264StreamWidth  = 960;
-        [Tooltip("Expected height of H.264 stream. Must match ViewEncoder.captureHeight on the client.")]
-        [SerializeField] private int h264StreamHeight = 540;
+        /// <summary>Codec used by the streaming client. Set before enabling the component.</summary>
+        public CodecMode Codec { get => codecMode; set => codecMode = value; }
 
         [SerializeField] private long _totalFramesDecoded;
 
@@ -80,6 +84,13 @@ namespace GameViewStream
         }
 
         private readonly Dictionary<ushort, ClientView> _views = new Dictionary<ushort, ClientView>();
+
+        // ── Externally-managed auto-claim state ───────────────────────────────────
+        // Set by SetAutoClaimForIP(). When non-null, the next StreamServer client whose
+        // IP matches _autoClaimIP is registered automatically, so frames are keyed by
+        // the StreamServer ID instead of an independent Netcode client ID.
+        private string   _autoClaimIP      = null;
+        private RawImage _autoClaimDisplay = null;
 
         // ── Thread-pool decode state ──────────────────────────────────────────────
 
@@ -107,16 +118,24 @@ namespace GameViewStream
         // ── Dependencies ─────────────────────────────────────────────────────────
 
         private StreamServer _server;
+        private bool _started;   // true after Start() has run — guards OnEnable on first activation
 
         // ── Unity lifecycle ──────────────────────────────────────────────────────
 
-        private void Awake()
+        /// <summary>
+        /// Resolves <see cref="_server"/> and performs initial registration.
+        /// Called once from <see cref="Start"/> so that runtime <c>AddComponent</c>
+        /// users can set <see cref="Server"/>, <see cref="Display"/>, etc.
+        /// before initialisation runs.
+        /// </summary>
+        private void ResolveAndRegister()
         {
             _server = server != null ? server : GetComponent<StreamServer>();
 
             if (_server == null)
             {
-                Debug.LogError("[ViewDecoder] No StreamServer found. Assign it in the Inspector.");
+                Debug.LogError("[ViewDecoder] No StreamServer found. Assign one via the Inspector "
+                             + "or set the Server property before enabling this component.");
                 return;
             }
 
@@ -126,7 +145,26 @@ namespace GameViewStream
                 RegisterClient(boundClientId, display);
         }
 
+        private void Start()
+        {
+            _started = true;
+            ResolveAndRegister();
+            BeginListening();
+        }
+
         private void OnEnable()
+        {
+            // First activation: Start() hasn't run yet — it will call BeginListening().
+            // This lets AddComponent callers configure properties before init.
+            if (!_started) return;
+            BeginListening();
+        }
+
+        /// <summary>
+        /// Subscribes to server events and spins up background decode workers.
+        /// Called from <see cref="Start"/> (first time) and <see cref="OnEnable"/> (re-enable).
+        /// </summary>
+        private void BeginListening()
         {
             if (_server == null) return;
             _server.OnClientConnected    += OnClientConnected;
@@ -137,9 +175,17 @@ namespace GameViewStream
             bool startWorkers = TurboJpeg.IsAvailable || (codecMode == CodecMode.H264 && H264Decoder.IsAvailable);
             if (startWorkers)
             {
+                // H.264 decode is strictly sequential per stream: feeding NAL units out of order
+                // corrupts the decoder state and produces artifacts until the next IDR frame.
+                // With a shared global ConcurrentQueue, N workers can dequeue frame K and frame K+1
+                // for the same client and race on the per-client lock — worker B may win and feed K+1
+                // before K.  Force a single worker for H.264 to guarantee FIFO delivery per client.
+                // MJPEG frames are independent (stateless), so multiple workers remain safe there.
+                int effectiveWorkerCount = (codecMode == CodecMode.H264) ? 1 : decodeWorkerCount;
+
                 _workerCts = new CancellationTokenSource();
-                _workers   = new Thread[decodeWorkerCount];
-                for (int i = 0; i < decodeWorkerCount; i++)
+                _workers   = new Thread[effectiveWorkerCount];
+                for (int i = 0; i < effectiveWorkerCount; i++)
                 {
                     var t = new Thread(DecodeWorkerLoop)
                         { IsBackground = true, Name = $"ViewDecoder-Worker-{i}" };
@@ -148,7 +194,7 @@ namespace GameViewStream
                 }
                 string mode = TurboJpeg.IsAvailable ? "TurboJpeg" : "";
                 if (codecMode == CodecMode.H264 && H264Decoder.IsAvailable) mode += (mode.Length > 0 ? " + " : "") + "H264/GVSTDecoder";
-                Debug.Log($"[ViewDecoder] Started {decodeWorkerCount} decode worker(s) ({mode}).");
+                Debug.Log($"[ViewDecoder] Started {effectiveWorkerCount} decode worker(s) ({mode}).");
             }
         }
 
@@ -246,37 +292,55 @@ namespace GameViewStream
 
         private void OnClientConnected(ushort clientId, IPAddress address)
         {
-            if (display == null) return;   // no inspector display — let code handle it
-
-            if (boundClientId == 0 || boundClientId == clientId)
+            if (display != null)
             {
-                // Auto-claim mode, or the same clientId reconnected.
-                // RegisterClient is safe to call again — it reuses the existing View if present,
-                // or creates a new one.  This handles both first-connect and reconnect.
-                RegisterClient(clientId, display);
+                // Inspector-wired mode: claim if auto-claim or matching re-connect.
+                if (boundClientId == 0 || boundClientId == clientId)
+                {
+                    RegisterClient(clientId, display);
+                    boundClientId = clientId;
+                    Debug.Log($"[ViewDecoder] Auto-claimed client {clientId} → {display.name}");
+                }
+                return;
+            }
+
+            // Externally-managed mode: claim if this client's IP matches the expected device.
+            // _autoClaimIP and _autoClaimDisplay are set by SetAutoClaimForIP() below.
+            // This ensures ViewDecoder is always keyed by the StreamServer's own client ID,
+            // not by an independent Netcode client ID — eliminating the ID mismatch that
+            // caused frames to be silently dropped after reconnect.
+            if (_autoClaimIP != null && address.ToString() == _autoClaimIP)
+            {
+                RegisterClient(clientId, _autoClaimDisplay);
                 boundClientId = clientId;
-                Debug.Log($"[ViewDecoder] Auto-claimed client {clientId} → {display.name}");
+                Debug.Log($"[ViewDecoder] IP-claimed StreamServer client {clientId} ({address}) → "
+                        + (_autoClaimDisplay != null ? _autoClaimDisplay.name : "null display"));
             }
         }
 
         private void OnClientDisconnected(ushort clientId)
         {
-            // On disconnect, detach the display but do NOT destroy the Texture2D or dispose
-            // the H264Decoder.  The same physical device often reconnects (timeout + re-send,
-            // or WiFi roam) and gets a new clientId.  Keeping the decoder alive avoids the
-            // cost of re-creating the MFT pipeline, and keeping the texture avoids a null
-            // display flash.  Resources are released in OnDestroy or when the component is
-            // disabled (OnDisable).
             if (_views.TryGetValue(clientId, out ClientView view))
             {
-                if (view.Display != null)
-                    view.Display.texture = null;
+                if (display != null)
+                {
+                    // Inspector-wired mode: null the texture (caller expects blank on disconnect).
+                    if (view.Display != null)
+                        view.Display.texture = null;
+                }
+                else
+                {
+                    // Externally-managed mode: preserve the last decoded frame on screen.
+                    // The disconnect mask (shown by the caller) already signals loss of connection.
+                    // Save the display ref so the next StreamServer connect re-claims it automatically.
+                    _autoClaimDisplay = view.Display;
+                }
                 _views.Remove(clientId);
             }
 
-            // Reset auto-claim so the next connecting client re-uses this display slot.
-            // Do NOT dispose the H264Decoder here — it will be reused or cleaned up in OnDisable.
-            if (clientId == boundClientId && display != null)
+            // Re-arm for the next StreamServer connect event for this device.
+            // Do NOT dispose the H264Decoder — it will be reused or cleaned up in OnDisable.
+            if (clientId == boundClientId)
                 boundClientId = 0;
         }
 
@@ -359,6 +423,41 @@ namespace GameViewStream
         public Texture2D GetClientTexture(ushort clientId)
             => _views.TryGetValue(clientId, out ClientView v) ? v.Texture : null;
 
+        /// <summary>
+        /// Arms this decoder to auto-claim the next <see cref="StreamServer"/> client whose
+        /// IP address equals <paramref name="ipAddress"/>.
+        /// Use this instead of <see cref="RegisterClient"/> when operating under
+        /// <c>ServerComponent</c>: it binds the view to the StreamServer's own client ID
+        /// rather than an independent Netcode client ID, so frame lookup in
+        /// <c>ApplyDecoded</c> always succeeds — even when the two systems assign different IDs.
+        /// Safe to call multiple times; each call re-arms for the next connect event.
+        /// </summary>
+        public void SetAutoClaimForIP(string ipAddress, RawImage rawImage)
+        {
+            _autoClaimIP      = ipAddress;
+            _autoClaimDisplay = rawImage;
+            boundClientId     = 0;   // re-arm so OnClientConnected will claim the next match
+
+            // Catch-up: the StreamServer TCP connection may have arrived and fired OnClientConnected
+            // BEFORE this method was called (e.g. the streaming TCP connect completes one frame
+            // before the Netcode "Connected" named message is processed by ServerComponent).
+            // In that case OnClientConnected already ran with _autoClaimIP == null and was ignored.
+            // Check now whether the matching client is already connected and register immediately.
+            // Use `server` (the inspector/public field) as a fallback because this method may be
+            // called immediately after AddComponent — before Start() has resolved `_server`.
+            StreamServer activeServer = _server ?? server;
+            if (activeServer != null && IPAddress.TryParse(ipAddress, out IPAddress addr))
+            {
+                if (activeServer.TryGetClientIdByAddress(addr, out ushort existingId))
+                {
+                    RegisterClient(existingId, rawImage);
+                    boundClientId = existingId;
+                    Debug.Log($"[ViewDecoder] SetAutoClaimForIP: catch-up registered already-connected "
+                            + $"client {existingId} ({ipAddress})");
+                }
+            }
+        }
+
         /// <summary>Returns decode statistics for every registered client.</summary>
         public IEnumerable<(ushort id, int frames)> GetStats()
         {
@@ -370,13 +469,19 @@ namespace GameViewStream
 
         private void DecodeWorkerLoop()
         {
+            // SpinWait yields with increasing backoff (busy-spin → Thread.Yield → Thread.Sleep(0/1)).
+            // This avoids the fixed ~15 ms stall that Thread.Sleep(1) imposes on Windows due to the
+            // default 15.6 ms timer resolution, which is the primary cause of decode jitter under
+            // bursty network conditions.
+            SpinWait spin = default;
             while (_workerCts != null && !_workerCts.IsCancellationRequested)
             {
                 if (_server == null || !_server.FrameQueue.TryDequeue(out ClientFrameData frame))
                 {
-                    Thread.Sleep(1);
+                    spin.SpinOnce();
                     continue;
                 }
+                spin.Reset();
 
                 // ── Route by codec type ───────────────────────────────────────────
 
@@ -387,7 +492,6 @@ namespace GameViewStream
                         break;
 
                     case NetworkProtocol.PacketType.H264Frame:
-                    case NetworkProtocol.PacketType.H264Fragment:
                         DecodeWorkerH264(frame);
                         break;
 
@@ -399,6 +503,7 @@ namespace GameViewStream
                 }
             }
         }
+
 
         // ── JPEG decode path (worker thread) ─────────────────────────────────────
 
@@ -450,16 +555,23 @@ namespace GameViewStream
                 return;
             }
 
-            // Lazily create and initialise an H264Decoder for this client
+            // Lazily create and initialise an H264Decoder for this client.
+            // The init hint (960×540) is only used to size the first staging buffer;
+            // the MFT reads the actual resolution from the H.264 SPS header and
+            // H264Decoder.Decode auto-reallocates if needed.
+            const int initHintW = 960;
+            const int initHintH = 540;
+
             var entry = _h264Decoders.GetOrAdd(frame.ClientId,
                 _ => (new H264Decoder(), new object()));
 
             byte[] rgba = null;
+            int decodedW, decodedH;
             lock (entry.Lock)
             {
                 if (!entry.Decoder.IsReady)
                 {
-                    if (!entry.Decoder.Initialize(h264StreamWidth, h264StreamHeight))
+                    if (!entry.Decoder.Initialize(initHintW, initHintH))
                     {
                         Debug.LogError($"[ViewDecoder] H264Decoder.Initialize failed for client {frame.ClientId}.");
                         ArrayPool<byte>.Shared.Return(payload);
@@ -467,19 +579,19 @@ namespace GameViewStream
                     }
                 }
 
-                if (frame.PacketType == NetworkProtocol.PacketType.H264Frame)
-                    rgba = entry.Decoder.Decode(payload, 0, payloadLen);
-                else
-                    rgba = entry.Decoder.FeedFragment(payload, payloadLen, frame.FrameId);
+                rgba = entry.Decoder.Decode(payload, 0, payloadLen);
+                // Read actual dimensions from the decoder (set by MFT after parsing SPS)
+                decodedW = entry.Decoder.Width;
+                decodedH = entry.Decoder.Height;
             }
 
             // H264 payload no longer needed
             ArrayPool<byte>.Shared.Return(payload);
 
-            if (rgba == null) return; // fragment not yet complete, or decode failed
+            if (rgba == null) return; // MFT still buffering or decode failed
 
-            int validBytes = h264StreamWidth * h264StreamHeight * 4;
-            EnqueueDecoded(frame.ClientId, frame.FrameId, h264StreamWidth, h264StreamHeight, rgba, validBytes);
+            int validBytes = decodedW * decodedH * 4;
+            EnqueueDecoded(frame.ClientId, frame.FrameId, decodedW, decodedH, rgba, validBytes);
         }
 
         // ── Shared ready-queue enqueue helper ────────────────────────────────────

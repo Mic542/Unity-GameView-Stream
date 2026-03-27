@@ -14,10 +14,8 @@ namespace GameViewStream
     /// [15..N] Payload      : data (see PacketType)
     ///
     /// VideoFrame payload : raw JPEG bytes (TurboJpeg / ImageConversion).
-    /// H264Frame payload  : complete H.264 Annex-B NAL unit sequence (fits in one UDP datagram).
-    /// H264Fragment payload: [frag_idx:uint8][frag_total:uint8][h264 chunk bytes…]
-    ///                       Multiple fragments share the same FrameId to identify the logical frame.
-    /// Connect / Disconnect: no payload.
+    /// H264Frame payload  : complete H.264 Annex-B NAL unit sequence.
+    /// Connect / Disconnect / Heartbeat: no payload.
     /// </summary>
     public static class NetworkProtocol
     {
@@ -27,11 +25,6 @@ namespace GameViewStream
         public const int  DiscoveryPort  = 9001;   // UDP port used for server auto-discovery
         public const int  HeaderSize     = 15;     // 4 magic + 1 type + 2 id + 4 frameId + 4 size
         public const int  MaxFrameSize   = 8 * 1024 * 1024; // 8 MB sanity cap per reassembled frame
-
-        /// <summary>Maximum H264 data bytes that fit in one UDP datagram alongside the main header.</summary>
-        public const int  MaxUdpPayload  = 65507;
-        public const int  FragSubHeaderSize = 2;   // frag_idx (1 byte) + frag_total (1 byte)
-        public const int  MaxH264ChunkSize  = MaxUdpPayload - HeaderSize - FragSubHeaderSize;
 
         /// <summary>UDP datagram the client broadcasts to find a server.</summary>
         public const string DiscoveryRequest  = "GVST_DISC";
@@ -47,8 +40,8 @@ namespace GameViewStream
             Connect      = 0x00,  // client→server: announce presence (no payload)
             VideoFrame   = 0x01,  // JPEG frame (TurboJpeg compressed)
             Disconnect   = 0x02,  // client→server: graceful goodbye
-            H264Frame    = 0x03,  // complete H.264 Annex-B NAL sequence (≤65507 B payload)
-            H264Fragment = 0x04,  // one chunk of a large H.264 frame (see FragSubHeaderSize)
+            H264Frame    = 0x03,  // complete H.264 Annex-B NAL sequence
+            Heartbeat    = 0x05,  // server→client ping / client→server pong (no payload)
         }
 
         // ── Builder helpers ──────────────────────────────────────────────────────
@@ -82,58 +75,15 @@ namespace GameViewStream
             return packet;
         }
 
-        /// <summary>
-        /// Serialise an H.264 Annex-B NAL unit sequence into one or more UDP-sized packets.
-        /// Returns a single <see cref="PacketType.H264Frame"/> packet when the data fits,
-        /// or multiple <see cref="PacketType.H264Fragment"/> packets otherwise.
-        /// </summary>
-        public static byte[][] BuildH264Packets(ushort clientId, uint frameId, byte[] h264Data, int length)
+        /// <summary>Serialise an H.264 Annex-B NAL unit sequence into a single framed packet.</summary>
+        public static byte[] BuildH264Packet(ushort clientId, uint frameId, byte[] h264Data, int length)
         {
             if (h264Data == null) throw new ArgumentNullException(nameof(h264Data));
 
-            if (HeaderSize + length <= MaxUdpPayload)
-            {
-                // Fits in one datagram — send as H264Frame
-                byte[] pkt = new byte[HeaderSize + length];
-                WriteHeader(pkt, PacketType.H264Frame, clientId, frameId, length);
-                Buffer.BlockCopy(h264Data, 0, pkt, HeaderSize, length);
-                return new[] { pkt };
-            }
-
-            // Fragment across multiple datagrams
-            int fragCount = (length + MaxH264ChunkSize - 1) / MaxH264ChunkSize;
-            if (fragCount > 255) fragCount = 255; // hard cap (each frag_idx/total is 1 byte)
-
-            byte[][] packets = new byte[fragCount][];
-            for (int i = 0; i < fragCount; i++)
-            {
-                int srcOffset  = i * MaxH264ChunkSize;
-                int chunkSize  = Math.Min(MaxH264ChunkSize, length - srcOffset);
-                int payloadSize = FragSubHeaderSize + chunkSize;
-
-                byte[] pkt = new byte[HeaderSize + payloadSize];
-                WriteHeader(pkt, PacketType.H264Fragment, clientId, frameId, payloadSize);
-                pkt[HeaderSize + 0] = (byte)i;           // frag_idx
-                pkt[HeaderSize + 1] = (byte)fragCount;   // frag_total
-                Buffer.BlockCopy(h264Data, srcOffset, pkt, HeaderSize + FragSubHeaderSize, chunkSize);
-                packets[i] = pkt;
-            }
-            return packets;
-        }
-
-        /// <summary>
-        /// Parse the two-byte fragment sub-header from an <see cref="PacketType.H264Fragment"/> payload.
-        /// Call after <see cref="TryParseHeader"/> confirms the type is H264Fragment.
-        /// </summary>
-        public static bool TryParseFragmentSubHeader(byte[] buffer, int payloadOffset,
-            out byte fragIndex, out byte fragTotal)
-        {
-            fragIndex = 0;
-            fragTotal = 0;
-            if (buffer == null || payloadOffset + FragSubHeaderSize > buffer.Length) return false;
-            fragIndex = buffer[payloadOffset];
-            fragTotal = buffer[payloadOffset + 1];
-            return fragTotal > 0;
+            byte[] pkt = new byte[HeaderSize + length];
+            WriteHeader(pkt, PacketType.H264Frame, clientId, frameId, length);
+            Buffer.BlockCopy(h264Data, 0, pkt, HeaderSize, length);
+            return pkt;
         }
 
         /// <summary>Serialise a Connect packet (no payload). Sent by the client on startup.</summary>
@@ -149,6 +99,18 @@ namespace GameViewStream
         {
             byte[] packet = new byte[HeaderSize];
             WriteHeader(packet, PacketType.Disconnect, clientId, 0, 0);
+            return packet;
+        }
+
+        /// <summary>
+        /// Serialise a Heartbeat packet (no payload).
+        /// Sent by the server to ping idle clients; the client echoes it back as a pong.
+        /// Receiving ANY packet from the client — including a data frame — also counts as liveness.
+        /// </summary>
+        public static byte[] BuildHeartbeatPacket()
+        {
+            byte[] packet = new byte[HeaderSize];
+            WriteHeader(packet, PacketType.Heartbeat, 0, 0, 0);
             return packet;
         }
 

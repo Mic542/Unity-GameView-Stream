@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -19,7 +20,13 @@ namespace GameViewStream
     /// Encoding pipeline:
     ///   Main thread   : AsyncGPUReadback → raw RGBA32 bytes → _rawQueue
     ///   Encode thread : _rawQueue → TurboJpeg.Encode → _sendQueue
-    ///   Send thread   : _sendQueue → TCP socket
+    ///   Send thread   : _sendQueue → TCP socket (with _tcpWriteLock for thread safety)
+    ///   Receive thread: TCP socket → heartbeat ping echo (keeps server idle clock alive)
+    ///
+    /// TCP benefits over the previous UDP implementation:
+    ///   • No spurious disconnects — socket exception = actual loss, not a timer.
+    ///   • No 65 KB datagram limit — large H.264 keyframes sent in a single Write().
+    ///   • Heartbeat ping/pong detects silent drops (WiFi pull, power management) within ~15 s.
     ///
     /// Setup:
     ///   1. Attach this component to the Camera you want to stream.
@@ -68,6 +75,15 @@ namespace GameViewStream
         [Tooltip("H.264 target bitrate in Mbps. 2 Mbps is recommended for 960×540 @ 30fps on WiFi LAN.")]
         [SerializeField, Range(1, 20)] private int h264BitrateMbps = 2;
 
+        // ── Events ───────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Raised on the **main thread** once the encoder discovers (or connects to) a
+        /// <see cref="StreamServer"/> and begins streaming.
+        /// Arguments: server IP string (e.g. "192.168.1.42"), server <see cref="IPEndPoint"/>.
+        /// </summary>
+        public event Action<string, IPEndPoint> OnServerDiscovered;
+
         // ── Private state ────────────────────────────────────────────────────────
 
         private Camera        _camera;
@@ -76,13 +92,16 @@ namespace GameViewStream
         // H.264 encoder (Android only — null on Editor / Windows)
         private H264Encoder _h264Encoder;
 
-        // Networking (UDP — connectionless, low-latency, tolerates lost frames)
-        private UdpClient     _udp;
+        // Networking (TCP — reliable, ordered, no datagram size limit)
+        private TcpClient     _tcp;
+        private NetworkStream _tcpStream;
         private IPEndPoint    _serverEndPoint;
         private volatile bool _isConnected;
+        // Serialises concurrent writes from SendLoop and the heartbeat pong in ReceiveServerMessages.
+        private readonly object _tcpWriteLock = new object();
         private CancellationTokenSource _cts;
 
-        // Three dedicated background threads
+        // Three dedicated background threads (receive thread is spawned per-connection inside DiscoverLoop)
         private Thread _discoverThread;
         private Thread _encodeThread;
         private Thread _sendThread;
@@ -93,6 +112,11 @@ namespace GameViewStream
 
         // Compressed packets ready to send
         private readonly ConcurrentQueue<byte[]> _sendQueue = new ConcurrentQueue<byte[]>();
+
+        // Signal wake events — replace Thread.Sleep(1) whose 15.6 ms Windows timer resolution
+        // is the primary source of encode/send jitter in busy projects.
+        private readonly ManualResetEventSlim _rawReady  = new ManualResetEventSlim(false);
+        private readonly ManualResetEventSlim _sendReady = new ManualResetEventSlim(false);
 
         // Frame capture state (main thread only)
         private uint  _frameId;
@@ -189,17 +213,18 @@ namespace GameViewStream
         private void OnDestroy()
         {
             _cts?.Cancel();
-            if (_isConnected && _udp != null && _serverEndPoint != null)
+            if (_isConnected && _tcpStream != null)
             {
                 try
                 {
                     byte[] disc = NetworkProtocol.BuildDisconnectPacket(0);
-                    _udp.Send(disc, disc.Length, _serverEndPoint);
+                    lock (_tcpWriteLock)
+                        _tcpStream.Write(disc, 0, disc.Length);
                 }
                 catch { /* best-effort */ }
             }
             _isConnected = false;
-            _udp?.Close();
+            _tcp?.Close();
             _h264Encoder?.Release();
             _h264Encoder?.Dispose();
             _h264Encoder = null;
@@ -224,6 +249,7 @@ namespace GameViewStream
                 _rawQueue.TryDequeue(out _);
 
             _rawQueue.Enqueue((_frameId++, raw));
+            _rawReady.Set();   // wake encode thread immediately
         }
 
         // ── Encode thread ────────────────────────────────────────────────────────
@@ -240,8 +266,13 @@ namespace GameViewStream
             {
                 if (!_rawQueue.TryDequeue(out var item))
                 {
-                    Thread.Sleep(1);
-                    continue;
+                    _rawReady.Reset();
+                    // Double-check after reset to avoid missed-signal race
+                    if (!_rawQueue.TryDequeue(out item))
+                    {
+                        _rawReady.Wait(50);  // 50 ms cap so we notice cancellation promptly
+                        continue;
+                    }
                 }
 
                 if (_cachedUseH264)
@@ -266,23 +297,11 @@ namespace GameViewStream
             }
 
             byte[] pkt = NetworkProtocol.BuildFramePacket(0, frameId, jpeg);
-
-            // UDP datagrams are capped at 65507 bytes. Drop oversized frames rather than crash.
-            // Reduce quality or resolution if this warning fires frequently.
-            if (pkt.Length > NetworkProtocol.MaxUdpPayload)
-            {
-                Debug.LogWarning($"[ViewEncoder] JPEG frame {frameId} too large for UDP "
-                               + $"({pkt.Length} B > {NetworkProtocol.MaxUdpPayload}) — dropped. Lower quality or resolution.");
-                return;
-            }
-
-            EnqueuePackets(new[] { pkt });
+            EnqueuePacket(pkt);
         }
 
         /// <summary>
-        /// Encode one RGBA32 frame to H.264 via MediaCodec and enqueue all resulting packets.
-        /// Large NAL sequences are automatically split into <see cref="NetworkProtocol.PacketType.H264Fragment"/>
-        /// packets so each datagram stays within the UDP size limit.
+        /// Encode one RGBA32 frame to H.264 via MediaCodec and enqueue the resulting packet.
         /// </summary>
         private void EncodeH264(uint frameId, byte[] raw)
         {
@@ -293,38 +312,32 @@ namespace GameViewStream
             // It is normal for MediaCodec to buffer a few frames before producing output.
             if (h264 == null || h264.Length == 0) return;
 
-            byte[][] pkts = NetworkProtocol.BuildH264Packets(0, frameId, h264, h264.Length);
-            EnqueuePackets(pkts);
+            byte[] pkt = NetworkProtocol.BuildH264Packet(0, frameId, h264, h264.Length);
+            EnqueuePacket(pkt);
         }
 
-        /// <summary>
-        /// Enqueue an array of ready-to-send packets, dropping old packets as needed to fit the
-        /// entire group.  Dropping is done atomically before any new packet is enqueued so that
-        /// multi-fragment H.264 frames are never partially stranded in the queue.
-        /// </summary>
-        private void EnqueuePackets(byte[][] pkts)
+        /// <summary>Enqueue a single packet, dropping the oldest if the queue is full.</summary>
+        private void EnqueuePacket(byte[] pkt)
         {
-            // Clamp to 0 so we never loop infinitely when pkts is larger than the cap
-            int maxExisting = Math.Max(0, sendQueueCapacity - pkts.Length);
-            while (_sendQueue.Count > maxExisting)
+            while (_sendQueue.Count >= sendQueueCapacity)
                 _sendQueue.TryDequeue(out _);
 
-            foreach (byte[] pkt in pkts)
-                _sendQueue.Enqueue(pkt);
+            _sendQueue.Enqueue(pkt);
+            _sendReady.Set();  // wake send thread immediately
         }
 
         // ── Background threads ───────────────────────────────────────────────────
 
         /// <summary>
         /// Continuously probes the LAN for a <see cref="StreamServer"/> via UDP broadcast.
-        /// Once found, opens a UDP socket and streams frames until a send error occurs,
+        /// Once found, opens a TCP connection and streams frames until the socket errors,
         /// then re-probes automatically.
         /// </summary>
         private void DiscoverLoop()
         {
             while (!_cts.IsCancellationRequested)
             {
-                // ── Discover ─────────────────────────────────────────────────────
+                // ── Discover ──────────────────────────────────────────────────────
                 if (autoDiscover)
                 {
                     while (!_cts.IsCancellationRequested)
@@ -345,29 +358,46 @@ namespace GameViewStream
                     _serverEndPoint = new IPEndPoint(IPAddress.Parse(serverAddress), serverPort);
                 }
 
-                // ── Stream ─────────────────────────────────────────────────────
+                // ── Connect via TCP ───────────────────────────────────────────────
                 try
                 {
-                    _udp         = new UdpClient();
-                    _isConnected = true;
-                    Debug.Log($"[ViewEncoder] Streaming UDP to {_serverEndPoint}.");
+                    _tcp           = new TcpClient();
+                    _tcp.NoDelay   = true;
+                    _tcp.SendBufferSize = 2 * 1024 * 1024; // 2 MB send buffer per client
+                    _tcp.Connect(_serverEndPoint);
+                    _tcpStream     = _tcp.GetStream();
+                    _isConnected   = true;
+                    Debug.Log($"[ViewEncoder] TCP connected to {_serverEndPoint}.");
+
+                    // Notify listeners on the main thread
+                    var ep = _serverEndPoint;
+                    MainThreadDispatcher.Enqueue(() => OnServerDiscovered?.Invoke(ep.Address.ToString(), ep));
 
                     // Announce presence so the server registers us before the first video frame
                     byte[] conn = NetworkProtocol.BuildConnectPacket();
-                    _udp.Send(conn, conn.Length, _serverEndPoint);
+                    lock (_tcpWriteLock) _tcpStream.Write(conn, 0, conn.Length);
 
+                    // Spawn a receive thread to read server→client messages (heartbeat pings).
+                    // Without this, the OS receive buffer would fill after enough server pings
+                    // and the server's Write() would block → deadlock.
+                    var recvThread = new Thread(ReceiveServerMessages)
+                        { IsBackground = true, Name = "ViewEncoder-Receive" };
+                    recvThread.Start();
+
+                    // Wait here until the connection drops (set by SendLoop or ReceiveServerMessages)
                     while (_isConnected && !_cts.IsCancellationRequested)
                         Thread.Sleep(100);
                 }
                 catch (Exception e)
                 {
-                    Debug.LogWarning($"[ViewEncoder] UDP error: {e.Message}");
+                    Debug.LogWarning($"[ViewEncoder] TCP connect/stream error: {e.Message}");
                 }
                 finally
                 {
                     _isConnected = false;
-                    _udp?.Close();
-                    _udp = null;
+                    _tcpStream   = null;
+                    _tcp?.Close();
+                    _tcp = null;
                 }
 
                 if (!_cts.IsCancellationRequested)
@@ -475,48 +505,133 @@ namespace GameViewStream
         }
 
         /// <summary>
-        /// Drains the send queue and fires each packet as a UDP datagram.
-        /// When the queue is idle (e.g. during H.264 MediaCodec warmup or low-FPS scenes),
-        /// sends a Connect heartbeat every second so the server does not time out the client.
+        /// Drains the send queue and writes each packet to the TCP stream.
+        /// When idle, sends a Heartbeat every second so no both sides know the connection is alive
+        /// (important during H.264 MediaCodec warmup when no frames are produced yet).
+        /// Sets <see cref="_isConnected"/> to false on any write error so <see cref="DiscoverLoop"/>
+        /// automatically reconnects.
         /// </summary>
         private void SendLoop()
         {
             long lastSentMs = 0;
-            byte[] keepalive = NetworkProtocol.BuildConnectPacket();
+            byte[] heartbeat = NetworkProtocol.BuildHeartbeatPacket();
 
             while (!_cts.IsCancellationRequested)
             {
-                if (_isConnected && _udp != null && _sendQueue.TryDequeue(out byte[] packet))
+                if (_isConnected && _tcpStream != null && _sendQueue.TryDequeue(out byte[] packet))
                 {
                     try
                     {
-                        _udp.Send(packet, packet.Length, _serverEndPoint);
+                        lock (_tcpWriteLock)
+                            _tcpStream.Write(packet, 0, packet.Length);
                         lastSentMs = NowMs;
                     }
                     catch (Exception e)
                     {
                         Debug.LogWarning($"[ViewEncoder] Send error: {e.Message}");
-                        _isConnected = false; // signals DiscoverLoop to re-probe
+                        _isConnected = false; // signals DiscoverLoop to reconnect
                     }
                 }
                 else
                 {
-                    // Send a keepalive heartbeat if nothing has been sent for 1 second.
-                    // This prevents the server from timing out during H.264 encoder warmup
-                    // (MediaCodec may take several frames before producing any output)
-                    // or any other period of encode inactivity.
-                    if (_isConnected && _udp != null && (NowMs - lastSentMs) >= 1000)
+                    // Send a Heartbeat if nothing has been sent for 1 second.
+                    // This prevents the server's heartbeat-timeout from firing during H.264 encoder
+                    // warmup (MediaCodec buffers several frames before producing output) or any
+                    // other period of encode inactivity such as the HMD proximity sensor pausing rendering.
+                    if (_isConnected && _tcpStream != null && (NowMs - lastSentMs) >= 1000)
                     {
                         try
                         {
-                            _udp.Send(keepalive, keepalive.Length, _serverEndPoint);
+                            lock (_tcpWriteLock)
+                                _tcpStream.Write(heartbeat, 0, heartbeat.Length);
                             lastSentMs = NowMs;
                         }
-                        catch { /* best-effort; will retry next loop */ }
+                        catch { /* receive thread will detect the error; stay quiet here */ }
                     }
-                    Thread.Sleep(1);
+                    _sendReady.Reset();
+                    if (_sendQueue.IsEmpty)
+                        _sendReady.Wait(50);  // 50 ms cap so heartbeat timing stays responsive
                 }
             }
+        }
+
+        /// <summary>
+        /// Reads the server→client half of the TCP stream for one connection lifetime.
+        /// Main job: echo <see cref="NetworkProtocol.PacketType.Heartbeat"/> pings back so the
+        /// server's idle clock stays reset while the camera is paused.
+        /// Sets <see cref="_isConnected"/> to false on any read error so <see cref="DiscoverLoop"/>
+        /// reconnects.
+        /// </summary>
+        private void ReceiveServerMessages()
+        {
+            NetworkStream stream = _tcpStream;
+            if (stream == null) return;
+
+            byte[] headerBuf = new byte[NetworkProtocol.HeaderSize];
+            try
+            {
+                while (_isConnected && !_cts.IsCancellationRequested)
+                {
+                    // Read fixed-size header (partial reads are normal on TCP)
+                    if (!ReadExact(stream, headerBuf, NetworkProtocol.HeaderSize))
+                        break; // graceful close from server
+
+                    if (!NetworkProtocol.TryParseHeader(headerBuf, 0,
+                            out NetworkProtocol.PacketType type, out _, out _, out int payloadSize))
+                    {
+                        Debug.LogWarning("[ViewEncoder] Bad header from server — disconnecting.");
+                        break;
+                    }
+
+                    // Drain any payload bytes (future-proofing; server currently sends none)
+                    if (payloadSize > 0)
+                    {
+                        byte[] discard = new byte[payloadSize];
+                        if (!ReadExact(stream, discard, payloadSize)) break;
+                    }
+
+                    if (type == NetworkProtocol.PacketType.Heartbeat)
+                    {
+                        // Echo pong back so the server's LastReceivedMs is reset.
+                        // Any data frame the encoder sends also resets it, so this only matters
+                        // during pauses (e.g. proximity sensor sleep, encode warmup).
+                        byte[] pong = NetworkProtocol.BuildHeartbeatPacket();
+                        try
+                        {
+                            lock (_tcpWriteLock)
+                                stream.Write(pong, 0, pong.Length);
+                        }
+                        catch { break; }
+                    }
+                }
+            }
+            catch (IOException)            { /* socket closed — normal */ }
+            catch (SocketException)        { /* reset by peer */ }
+            catch (ObjectDisposedException) { /* closed from our side */ }
+            catch (Exception e)
+            {
+                if (!_cts.IsCancellationRequested)
+                    Debug.LogWarning($"[ViewEncoder] Receive error: {e.Message}");
+            }
+
+            _isConnected = false; // unblocks DiscoverLoop's sleep loop → triggers reconnect
+        }
+
+        /// <summary>
+        /// Reads exactly <paramref name="count"/> bytes from <paramref name="stream"/>.
+        /// Returns false if the server closes the connection before all bytes arrive.
+        /// TCP Read() only guarantees ≥1 byte — this wrapper handles partial reads.
+        /// </summary>
+        private static bool ReadExact(NetworkStream stream, byte[] buffer, int count)
+        {
+            int read = 0;
+            while (read < count)
+            {
+                int n = stream.Read(buffer, read, count - read);
+                if (n == 0) return false; // graceful close
+                read += n;
+            }
+            return true;
         }
 
         private static long NowMs =>

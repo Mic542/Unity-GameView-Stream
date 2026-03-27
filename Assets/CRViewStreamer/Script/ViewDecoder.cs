@@ -63,14 +63,6 @@ namespace GameViewStream
                + "Prevents unbounded memory use if the main thread stalls during long sessions.")]
         [SerializeField, Range(8, 256)] private int readyQueueCap = 64;
 
-        [Tooltip("Choose the codec used by the streaming client.\n"
-               + "MJPEG: CPU decode via TurboJpeg. Low latency but much higher bandwidth usage.\n"
-               + "H264: Hardware decode via GVSTDecoder (any GPU vendor, Windows only).\n"
-               + "H.264 stream resolution is detected automatically from the SPS header.")]
-        [SerializeField] private CodecMode codecMode = CodecMode.MJPEG;
-        /// <summary>Codec used by the streaming client. Set before enabling the component.</summary>
-        public CodecMode Codec { get => codecMode; set => codecMode = value; }
-
         [SerializeField] private long _totalFramesDecoded;
 
         // ── Per-client state ─────────────────────────────────────────────────────
@@ -170,31 +162,24 @@ namespace GameViewStream
             _server.OnClientConnected    += OnClientConnected;
             _server.OnClientDisconnected += OnClientDisconnected;
 
-            // Start background decode workers when TurboJpeg is available (JPEG path)
-            // or when H.264 decode is requested (H264Decoder/GVSTDecoder path).
-            bool startWorkers = TurboJpeg.IsAvailable || (codecMode == CodecMode.H264 && H264Decoder.IsAvailable);
-            if (startWorkers)
+            // Start background decode workers when any decode backend is available.
+            // Codec is detected automatically from the incoming packet type (VideoFrame vs H264Frame).
+            bool canDecode = TurboJpeg.IsAvailable || H264Decoder.IsAvailable;
+            if (canDecode)
             {
-                // H.264 decode is strictly sequential per stream: feeding NAL units out of order
-                // corrupts the decoder state and produces artifacts until the next IDR frame.
-                // With a shared global ConcurrentQueue, N workers can dequeue frame K and frame K+1
-                // for the same client and race on the per-client lock — worker B may win and feed K+1
-                // before K.  Force a single worker for H.264 to guarantee FIFO delivery per client.
-                // MJPEG frames are independent (stateless), so multiple workers remain safe there.
-                int effectiveWorkerCount = (codecMode == CodecMode.H264) ? 1 : decodeWorkerCount;
-
                 _workerCts = new CancellationTokenSource();
-                _workers   = new Thread[effectiveWorkerCount];
-                for (int i = 0; i < effectiveWorkerCount; i++)
+                _workers   = new Thread[decodeWorkerCount];
+                for (int i = 0; i < decodeWorkerCount; i++)
                 {
                     var t = new Thread(DecodeWorkerLoop)
                         { IsBackground = true, Name = $"ViewDecoder-Worker-{i}" };
                     _workers[i] = t;
                     t.Start();
                 }
-                string mode = TurboJpeg.IsAvailable ? "TurboJpeg" : "";
-                if (codecMode == CodecMode.H264 && H264Decoder.IsAvailable) mode += (mode.Length > 0 ? " + " : "") + "H264/GVSTDecoder";
-                Debug.Log($"[ViewDecoder] Started {effectiveWorkerCount} decode worker(s) ({mode}).");
+                string backends = "";
+                if (TurboJpeg.IsAvailable)     backends += "TurboJpeg";
+                if (H264Decoder.IsAvailable)   backends += (backends.Length > 0 ? " + " : "") + "GVSTDecoder";
+                Debug.Log($"[ViewDecoder] Started {decodeWorkerCount} decode worker(s) ({backends}).");
             }
         }
 
@@ -233,7 +218,7 @@ namespace GameViewStream
         {
             if (_server == null) return;
 
-            bool useWorkers = TurboJpeg.IsAvailable || (codecMode == CodecMode.H264 && H264Decoder.IsAvailable);
+            bool useWorkers = TurboJpeg.IsAvailable || H264Decoder.IsAvailable;
 
             if (useWorkers)
             {

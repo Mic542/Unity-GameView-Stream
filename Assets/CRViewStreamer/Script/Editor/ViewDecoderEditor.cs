@@ -24,25 +24,15 @@ namespace GameViewStream
             Header("Decode Settings");
             EditorGUILayout.PropertyField(Prop("maxDecodePerFrame"));
 
-            // Read codecMode early so we can use it in Performance and Codec sections
-            var codecModeProp = Prop("codecMode");
-
             // ── Performance ──────────────────────────────────────────────────────
             Header("Performance");
-            bool isH264 = codecModeProp.enumValueIndex == (int)CodecMode.H264;
-            using (new EditorGUI.DisabledScope(isH264))
-            {
-                EditorGUILayout.PropertyField(Prop("decodeWorkerCount"));
-                if (isH264)
-                    EditorGUILayout.HelpBox("H.264 requires strictly sequential NAL feeding — worker count is forced to 1 at runtime.", MessageType.Info);
-            }
+            EditorGUILayout.PropertyField(Prop("decodeWorkerCount"));
             EditorGUILayout.PropertyField(Prop("readyQueueCap"));
-
-            // ── Codec ───────────────────────────────────────────────────────────
-            Header("Codec");
-            EditorGUILayout.PropertyField(codecModeProp, new GUIContent("Codec Mode"));
-            // if (isH264)
-            //     EditorGUILayout.HelpBox("Stream resolution is detected automatically from the H.264 SPS header — no manual width/height needed.", MessageType.Info);
+            EditorGUILayout.HelpBox(
+                "Codec is detected automatically from the incoming stream.\n"
+              + "\u2022 MJPEG: multiple workers scale with client count.\n"
+              + "\u2022 H.264: workers share a per-client lock for sequential NAL feeding.",
+                MessageType.Info);
 
             // ── Debug ─────────────────────────────────────────────────────────────
             Header("Debug (read-only)");

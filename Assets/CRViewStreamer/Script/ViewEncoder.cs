@@ -157,9 +157,19 @@ namespace GameViewStream
             _cachedHeight      = captureHeight;
             _cachedQuality     = jpegQuality;
             _cachedSubsampling = jpegSubsampling;
-            _h264Intended      = codecMode == CodecMode.H264;  // remember the inspector intent — never fall back to JPEG if this is true
+            _h264Intended      = codecMode == CodecMode.H264;
             _cachedUseH264     = codecMode == CodecMode.H264 && H264Encoder.IsAvailable;
             _cachedH264Bitrate = h264BitrateMbps * 1_000_000;
+
+            // Auto-fallback: H.264 requested but not available (e.g. Windows Editor).
+            // On platforms where TurboJpeg IS available, fall back to MJPEG silently.
+            // On Android (where TurboJpeg may not be bundled), keep _h264Intended true
+            // so EncodeLoop drops frames instead of crashing on a missing libturbojpeg.so.
+            if (_h264Intended && !_cachedUseH264 && TurboJpeg.IsAvailable)
+            {
+                Debug.LogWarning("[ViewEncoder] H.264 encoder not available on this platform — falling back to MJPEG.");
+                _h264Intended = false;  // allow JPEG path in EncodeLoop
+            }
 
             // Initialise H.264 encoder on the main thread (safe for AndroidJavaObject)
             if (_cachedUseH264)
@@ -167,14 +177,22 @@ namespace GameViewStream
                 _h264Encoder = new H264Encoder();
                 if (!_h264Encoder.Initialize(_cachedWidth, _cachedHeight, _cachedH264Bitrate, targetFPS))
                 {
-                    // Initialisation failed.  If the user intended H.264 we must NOT fall back to
-                    // JPEG — libturbojpeg.so may not be in the APK and the DllImport would crash.
-                    // Frames will simply be dropped until the encoder comes up.
-                    Debug.LogError("[ViewEncoder] H264Encoder.Initialize failed. Frames will be dropped until resolved.");
+                    // Initialisation failed. On Android, libturbojpeg.so may not be in the APK,
+                    // so we cannot fall back to JPEG — frames will be dropped until resolved.
+                    // On other platforms, fall back to MJPEG if TurboJpeg is available.
                     _h264Encoder.Dispose();
                     _h264Encoder   = null;
                     _cachedUseH264 = false;
-                    // _h264Intended stays true → EncodeLoop will skip frames instead of calling TurboJpeg
+
+                    if (TurboJpeg.IsAvailable)
+                    {
+                        Debug.LogWarning("[ViewEncoder] H264Encoder.Initialize failed — falling back to MJPEG.");
+                        _h264Intended = false;
+                    }
+                    else
+                    {
+                        Debug.LogError("[ViewEncoder] H264Encoder.Initialize failed and TurboJpeg unavailable. Frames will be dropped.");
+                    }
                 }
                 else
                 {

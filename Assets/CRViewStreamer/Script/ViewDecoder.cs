@@ -550,9 +550,21 @@ namespace GameViewStream
             var entry = _h264Decoders.GetOrAdd(frame.ClientId,
                 _ => (new H264Decoder(), new object()));
 
+            // H.264 NAL units MUST be fed in strict FIFO order per client.
+            // With N workers, two can dequeue frames K and K+1 simultaneously.
+            // If we used a blocking lock, worker-B could win the lock first and feed K+1
+            // before K — corrupting decoder state until the next IDR.
+            // Instead, TryEnter: if another worker is already decoding for this client,
+            // re-enqueue the frame so it's retried later in the correct order.
+            if (!Monitor.TryEnter(entry.Lock))
+            {
+                _server.FrameQueue.Enqueue(frame);  // put it back for retry
+                return;
+            }
+
             byte[] rgba = null;
             int decodedW, decodedH;
-            lock (entry.Lock)
+            try
             {
                 if (!entry.Decoder.IsReady)
                 {
@@ -568,6 +580,10 @@ namespace GameViewStream
                 // Read actual dimensions from the decoder (set by MFT after parsing SPS)
                 decodedW = entry.Decoder.Width;
                 decodedH = entry.Decoder.Height;
+            }
+            finally
+            {
+                Monitor.Exit(entry.Lock);
             }
 
             // H264 payload no longer needed

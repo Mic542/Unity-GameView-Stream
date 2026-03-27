@@ -13,6 +13,7 @@ namespace GameViewStream
 
             // ── Server Settings ──────────────────────────────────────────────────
             Header("Server Settings");
+            EditorGUILayout.PropertyField(Prop("transportMode"), new GUIContent("Transport Mode"));
             EditorGUILayout.PropertyField(Prop("port"),       new GUIContent("Port"));
             EditorGUILayout.PropertyField(Prop("maxClients"), new GUIContent("Max Clients"));
 

@@ -27,8 +27,9 @@ namespace GameViewStream
             }
             else
             {
-                EditorGUILayout.PropertyField(Prop("serverAddress"), new GUIContent("Server Address"));
-                EditorGUILayout.PropertyField(Prop("serverPort"),    new GUIContent("Server Port"));
+                EditorGUILayout.PropertyField(Prop("serverAddress"),        new GUIContent("Server Address"));
+                EditorGUILayout.PropertyField(Prop("serverPort"),           new GUIContent("Server Port"));
+                EditorGUILayout.PropertyField(Prop("manualTransportMode"),  new GUIContent("Transport Mode"));
             }
             EditorGUI.indentLevel--;
 
@@ -60,6 +61,24 @@ namespace GameViewStream
             Header("Queue Settings");
             EditorGUILayout.PropertyField(Prop("rawQueueCapacity"),  new GUIContent("Raw Queue Capacity"));
             EditorGUILayout.PropertyField(Prop("sendQueueCapacity"), new GUIContent("Send Queue Capacity"));
+
+            // ── Reliable UDP ──────────────────────────────────────────────────────
+            Header("Reliable UDP");
+            EditorGUILayout.PropertyField(Prop("sendReliable"), new GUIContent("Send Reliable"));
+
+            var reliableProp = Prop("sendReliable");
+            if (reliableProp.boolValue)
+            {
+                EditorGUI.indentLevel++;
+                EditorGUILayout.PropertyField(Prop("retransmitMs"), new GUIContent("Retransmit (ms)"));
+                EditorGUILayout.PropertyField(Prop("maxRetries"),   new GUIContent("Max Retries"));
+                EditorGUI.indentLevel--;
+            }
+
+            EditorGUILayout.HelpBox(
+                "Only applies when the server selects UDP transport mode.\n"
+              + "Adds sequence numbers and ACK-based retransmission to prevent packet loss on WiFi.",
+                MessageType.Info);
 
             serializedObject.ApplyModifiedProperties();
         }

@@ -2,6 +2,9 @@ using System;
 
 namespace GameViewStream
 {
+    /// <summary>Transport used for the data channel between client and server.</summary>
+    public enum TransportMode : byte { TCP = 0, UDP = 1 }
+
     /// <summary>
     /// Shared binary protocol for frame streaming between Android VR client and PC server.
     ///
@@ -26,6 +29,18 @@ namespace GameViewStream
         public const int  HeaderSize     = 15;     // 4 magic + 1 type + 2 id + 4 frameId + 4 size
         public const int  MaxFrameSize   = 8 * 1024 * 1024; // 8 MB sanity cap per reassembled frame
 
+        // ── UDP-specific constants ────────────────────────────────────────────────
+
+        /// <summary>Maximum safe UDP datagram payload on a LAN (below 64 KB IP fragmentation threshold).</summary>
+        public const int MaxUdpPayload    = 60_000;
+        /// <summary>Fragment sub-header size: [1 origType][1 fragIndex][1 fragTotal].</summary>
+        public const int FragSubHeaderSize = 3;
+        /// <summary>Maximum codec data bytes per UDP fragment datagram.</summary>
+        public const int MaxUdpChunkSize  = MaxUdpPayload - HeaderSize - FragSubHeaderSize;
+
+        /// <summary>Reliable UDP sequence number prefix size (4-byte uint32 BE, prepended to each datagram).</summary>
+        public const int ReliableSeqSize  = 4;
+
         /// <summary>UDP datagram the client broadcasts to find a server.</summary>
         public const string DiscoveryRequest  = "GVST_DISC";
         /// <summary>Prefix the server sends back; full message is "GVST_HERE:&lt;port&gt;".</summary>
@@ -41,7 +56,9 @@ namespace GameViewStream
             VideoFrame   = 0x01,  // JPEG frame (TurboJpeg compressed)
             Disconnect   = 0x02,  // client→server: graceful goodbye
             H264Frame    = 0x03,  // complete H.264 Annex-B NAL sequence
+            Fragment     = 0x04,  // fragmented payload (UDP only); sub-header carries original type
             Heartbeat    = 0x05,  // server→client ping / client→server pong (no payload)
+            Ack          = 0x06,  // server→client: acknowledges a reliable UDP datagram (seqNum in FrameId)
         }
 
         // ── Builder helpers ──────────────────────────────────────────────────────
@@ -114,6 +131,79 @@ namespace GameViewStream
             return packet;
         }
 
+        /// <summary>
+        /// Serialise an ACK packet (no payload). The <paramref name="seqNum"/> is stored
+        /// in the FrameId header field so the client can match it to a pending reliable send.
+        /// </summary>
+        public static byte[] BuildAckPacket(uint seqNum)
+        {
+            byte[] packet = new byte[HeaderSize];
+            WriteHeader(packet, PacketType.Ack, 0, seqNum, 0);
+            return packet;
+        }
+
+        /// <summary>
+        /// Prepend a 4-byte big-endian sequence number to an existing GVST packet
+        /// for reliable UDP delivery.  The server detects the prefix by checking
+        /// whether the GVST magic starts at offset 4 instead of offset 0.
+        /// </summary>
+        public static byte[] PrependReliableSeq(byte[] packet, uint seqNum)
+        {
+            byte[] wrapped = new byte[ReliableSeqSize + packet.Length];
+            wrapped[0] = (byte)(seqNum >> 24);
+            wrapped[1] = (byte)(seqNum >> 16);
+            wrapped[2] = (byte)(seqNum >> 8);
+            wrapped[3] = (byte)(seqNum & 0xFF);
+            Buffer.BlockCopy(packet, 0, wrapped, ReliableSeqSize, packet.Length);
+            return wrapped;
+        }
+
+        // ── UDP fragment builder ─────────────────────────────────────────────────
+
+        /// <summary>
+        /// Build one or more UDP-safe packets for the given payload.
+        /// If the payload fits in a single datagram, returns one normal packet (VideoFrame / H264Frame).
+        /// Otherwise, splits into <see cref="PacketType.Fragment"/> packets whose sub-header
+        /// carries the original type so the receiver can reassemble.
+        /// </summary>
+        public static byte[][] BuildUdpPackets(PacketType originalType, ushort clientId,
+            uint frameId, byte[] data, int length)
+        {
+            if (data == null) throw new ArgumentNullException(nameof(data));
+
+            int maxSinglePayload = MaxUdpPayload - HeaderSize;
+            if (length <= maxSinglePayload)
+            {
+                // Fits in one datagram — send as a normal, unfragmented packet.
+                byte[] pkt = new byte[HeaderSize + length];
+                WriteHeader(pkt, originalType, clientId, frameId, length);
+                Buffer.BlockCopy(data, 0, pkt, HeaderSize, length);
+                return new[] { pkt };
+            }
+
+            int numFrags = (length + MaxUdpChunkSize - 1) / MaxUdpChunkSize;
+            if (numFrags > 255)
+                throw new InvalidOperationException(
+                    $"Frame too large to fragment ({length} bytes → {numFrags} fragments, max 255).");
+
+            byte[][] packets = new byte[numFrags][];
+            for (int i = 0; i < numFrags; i++)
+            {
+                int srcOffset  = i * MaxUdpChunkSize;
+                int chunkLen   = Math.Min(MaxUdpChunkSize, length - srcOffset);
+                int pktPayload = FragSubHeaderSize + chunkLen;
+
+                byte[] pkt = new byte[HeaderSize + pktPayload];
+                WriteHeader(pkt, PacketType.Fragment, clientId, frameId, pktPayload);
+                pkt[HeaderSize]     = (byte)originalType;   // original codec type
+                pkt[HeaderSize + 1] = (byte)i;              // fragment index (0-based)
+                pkt[HeaderSize + 2] = (byte)numFrags;       // total fragment count
+                Buffer.BlockCopy(data, srcOffset, pkt, HeaderSize + FragSubHeaderSize, chunkLen);
+                packets[i] = pkt;
+            }
+            return packets;
+        }
+
         // ── Parser ──────────────────────────────────────────────────────────────
 
         /// <summary>
@@ -148,6 +238,25 @@ namespace GameViewStream
                         | (buffer[offset + 13] << 8)  |  buffer[offset + 14];
 
             return payloadSize >= 0 && payloadSize <= MaxFrameSize;
+        }
+
+        /// <summary>
+        /// Parse the 3-byte fragment sub-header from a <see cref="PacketType.Fragment"/> packet payload.
+        /// Layout: [0] original PacketType, [1] fragment index (0-based), [2] total fragment count.
+        /// </summary>
+        public static bool TryParseFragmentSubHeader(byte[] buffer, int offset,
+            out PacketType originalType, out byte fragmentIndex, out byte totalFragments)
+        {
+            originalType   = PacketType.VideoFrame;
+            fragmentIndex  = 0;
+            totalFragments = 0;
+
+            if (buffer == null || offset + FragSubHeaderSize > buffer.Length) return false;
+
+            originalType   = (PacketType)buffer[offset];
+            fragmentIndex  = buffer[offset + 1];
+            totalFragments = buffer[offset + 2];
+            return totalFragments > 0 && fragmentIndex < totalFragments;
         }
     }
 }

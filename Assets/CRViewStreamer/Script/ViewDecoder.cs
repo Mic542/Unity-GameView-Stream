@@ -310,7 +310,7 @@ namespace GameViewStream
                                     }
                                 }
                             }
-                            if (holdOverflow.PixelData != null)
+                            if (holdOverflow != null && holdOverflow.PixelData != null)
                                 DecodeAndFlushH264(state, holdOverflow, ct);
                         }
                         catch (OperationCanceledException) { return; }

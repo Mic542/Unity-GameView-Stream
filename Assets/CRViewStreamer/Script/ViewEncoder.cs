@@ -54,11 +54,11 @@ namespace GameViewStream
         [SerializeField] private TransportMode manualTransportMode = TransportMode.TCP;
 
         [Tooltip("Width of the capture texture. Lower = less bandwidth (e.g. 480x270 for 10+ clients).")]
-        [SerializeField] private int captureWidth  = 960;
+        [SerializeField] private int captureWidth  = 480;
         [Tooltip("Height of the capture texture.")]
-        [SerializeField] private int captureHeight = 540;
+        [SerializeField] private int captureHeight = 272;
         [Tooltip("Maximum frames per second to encode and send.")]
-        [SerializeField, Range(5, 60)] private int targetFPS = 30;
+        [SerializeField, Range(5, 60)] private int targetFPS = 15;
 
         [Tooltip("JPEG quality 1-100. 75 is a good streaming default (good quality, lower bandwidth).")]
         [SerializeField, Range(1, 100)] private int jpegQuality = 75;
@@ -66,26 +66,58 @@ namespace GameViewStream
         [SerializeField] private int jpegSubsampling = TurboJpeg.TJSAMP_420;
         [Tooltip("Max raw frames held in queue for the encode thread. Older frames are dropped — latency beats delivery.")]
         [SerializeField, Range(1, 4)] private int rawQueueCapacity  = 2;
-        [Tooltip("Max compressed packets queued for the send thread.")]
-        [SerializeField, Range(1, 4)] private int sendQueueCapacity = 2;
+        [Tooltip("Max compressed packets queued for the send thread.\n"
+               + "For H.264, every frame is critical (P-frames reference previous frames).\n"
+               + "A queue that is too small DROPS frames, corrupting ALL subsequent H.264\n"
+               + "output until the next IDR keyframe. 512 = ~15 s buffer at 30 fps.")]
+        [SerializeField, Range(1, 1024)] private int sendQueueCapacity = 512;
 
         [Tooltip("Choose the encoding codec.\n"
                + "MJPEG: CPU encode via TurboJpeg. Works on all platforms including Windows Editor.\n"
                + "H264: GPU encode via Android MediaCodec. Lower bandwidth, Android device only.")]
         [SerializeField] private CodecMode codecMode = CodecMode.MJPEG;
-        [Tooltip("H.264 target bitrate in Mbps. 2 Mbps is recommended for 960×540 @ 30fps on WiFi LAN.")]
-        [SerializeField, Range(1, 20)] private int h264BitrateMbps = 2;
+        [Tooltip("H.264 target bitrate in Mbps (CBR). This is the actual network bandwidth.\n"
+               + "0.1 Mbps = ~100 kbps — aggressive, low-res/low-fps.\n"
+               + "0.3 Mbps = ~300 kbps — good balance for 320×240–540p.\n"
+               + "1.0 Mbps = ~1000 kbps — high quality 960×540.\n"
+               + "Set lower if bandwidth is limited.")]
+        [SerializeField, Range(0.05f, 20f)] private float h264BitrateMbps = 0.8f;
+
+        [Tooltip("Seconds between IDR keyframes (I-frame interval).\n"
+               + "0   = every frame is an I-frame (recommended — no motion smearing).\n"
+               + "0.1 = IDR every 100 ms (~1-2 P-frames at 15 fps).\n"
+               + "0.5 = IDR every 500 ms (~7 P-frames at 15 fps).\n"
+               + "1   = IDR every 1 s (~15 P-frames at 15 fps).\n\n"
+               + "Values > 0 allow P-frames for better compression but may cause\n"
+               + "motion-smearing on some Android MediaCodec implementations.\n"
+               + "All-I mode (0) is still ~30-50% smaller than MJPEG.")]
+        [SerializeField, Range(0f, 5f)] private float h264IFrameInterval = 0f;
 
         [Tooltip("When enabled and the server selects UDP transport, every outgoing datagram gets a\n"
                + "sequence number and the server sends back an ACK. Un-ACKed packets are re-sent\n"
                + "after Retransmit Ms, up to Max Retries times. Prevents packet loss on busy WiFi.")]
         [SerializeField] private bool sendReliable    = true;
         [Tooltip("Milliseconds to wait before retransmitting an un-ACKed reliable datagram.\n"
-               + "LAN round-trip is typically <2 ms — 50 ms gives plenty of headroom.")]
-        [SerializeField, Range(10, 500)] private int retransmitMs = 50;
+               + "LAN round-trip is typically <2 ms — 200 ms gives headroom without retransmit storms.")]
+        [SerializeField, Range(10, 2000)] private int retransmitMs = 200;
         [Tooltip("Maximum retransmission attempts per datagram before giving up.\n"
                + "After this many retries the datagram is dropped (heartbeat/reconnect handles total loss).")]
-        [SerializeField, Range(1, 30)] private int maxRetries = 10;
+        [SerializeField, Range(1, 30)] private int maxRetries = 5;
+
+        // ── Diagnostics ──────────────────────────────────────────────────────────
+
+        [Header("─── Diagnostics ───")]
+
+        [Tooltip("Save the raw H.264 Annex-B bitstream to a file on the device.\n"
+               + "Pull with: adb pull /sdcard/Android/data/<pkg>/files/debug_h264.bin\n"
+               + "Play with: ffplay -f h264 debug_h264.bin\n"
+               + "If the file looks clean in VLC/ffplay, the encoder is correct and\n"
+               + "the problem is downstream (transport or decoder).")]
+        [SerializeField] private bool debugDumpH264 = false;
+
+        [Tooltip("Maximum number of H.264 frames to dump (0 = unlimited).\n"
+               + "300 frames ≈ 10 seconds at 30 fps. The file is closed when this limit is reached.")]
+        [SerializeField] private int debugDumpMaxFrames = 0;
 
         // ── Events ───────────────────────────────────────────────────────────────
 
@@ -100,6 +132,7 @@ namespace GameViewStream
 
         private Camera        _camera;
         private RenderTexture _captureRT;
+        private byte[] _gpuStagingBuffer;
 
         // H.264 encoder (Android only — null on Editor / Windows)
         private H264Encoder _h264Encoder;
@@ -153,6 +186,8 @@ namespace GameViewStream
         private float _captureInterval;
         private float _lastCaptureTime;
         private bool  _gpuReadbackPending;
+        private float _gpuReadbackRequestTime; // watchdog: when readback was issued, to detect stuck readbacks
+        private int   _connectionGeneration;   // incremented on each TCP connect to detect stale recv threads
 
         // Cached at Start() so encode thread never accesses Unity properties
         private int  _cachedWidth;
@@ -162,6 +197,15 @@ namespace GameViewStream
         private bool _cachedUseH264;      // true  = H.264 path is active
         private bool _h264Intended;       // true  = user checked Use H264 (never fall back to JPEG)
         private int  _cachedH264Bitrate;
+
+        // Bandwidth measurement — logs encoder output rate and wire rate every 5 s
+        private long _bwEncoderBytes;      // total H.264 bytes produced by encoder since last log
+        private long _bwWireBytes;         // total bytes written to TCP/UDP since last log
+        private long _bwLastLogMs;
+
+        // ── Diagnostic state ──────────────────────────────────────────────────
+        private FileStream _debugH264File;
+        private int        _debugH264FrameCount;
 
         // ── Reliable UDP helpers ──────────────────────────────────────────────
 
@@ -185,6 +229,14 @@ namespace GameViewStream
         /// </summary>
         private void RetransmitPending()
         {
+            // Cap: if too many pending ACKs accumulate (e.g. server unreachable),
+            // clear them all — those frames are stale for real-time streaming anyway.
+            if (_pendingAcks.Count > 100)
+            {
+                _pendingAcks.Clear();
+                return;
+            }
+
             long now = NowMs;
             foreach (var kv in _pendingAcks)
             {
@@ -235,52 +287,13 @@ namespace GameViewStream
             _cachedHeight      = captureHeight;
             _cachedQuality     = jpegQuality;
             _cachedSubsampling = jpegSubsampling;
-            _h264Intended      = codecMode == CodecMode.H264;
-            _cachedUseH264     = codecMode == CodecMode.H264 && H264Encoder.IsAvailable;
-            _cachedH264Bitrate  = h264BitrateMbps * 1_000_000;
+            _cachedH264Bitrate  = (int)(h264BitrateMbps * 1_000_000);
             _cachedSendReliable = sendReliable;
             _cachedRetransmitMs = retransmitMs;
             _cachedMaxRetries   = maxRetries;
 
-            // Auto-fallback: H.264 requested but not available (e.g. Windows Editor).
-            // On platforms where TurboJpeg IS available, fall back to MJPEG silently.
-            // On Android (where TurboJpeg may not be bundled), keep _h264Intended true
-            // so EncodeLoop drops frames instead of crashing on a missing libturbojpeg.so.
-            if (_h264Intended && !_cachedUseH264 && TurboJpeg.IsAvailable)
-            {
-                Debug.LogWarning("[ViewEncoder] H.264 encoder not available on this platform — falling back to MJPEG.");
-                _h264Intended = false;  // allow JPEG path in EncodeLoop
-            }
-
-            // Initialise H.264 encoder on the main thread (safe for AndroidJavaObject)
-            if (_cachedUseH264)
-            {
-                _h264Encoder = new H264Encoder();
-                if (!_h264Encoder.Initialize(_cachedWidth, _cachedHeight, _cachedH264Bitrate, targetFPS))
-                {
-                    // Initialisation failed. On Android, libturbojpeg.so may not be in the APK,
-                    // so we cannot fall back to JPEG — frames will be dropped until resolved.
-                    // On other platforms, fall back to MJPEG if TurboJpeg is available.
-                    _h264Encoder.Dispose();
-                    _h264Encoder   = null;
-                    _cachedUseH264 = false;
-
-                    if (TurboJpeg.IsAvailable)
-                    {
-                        Debug.LogWarning("[ViewEncoder] H264Encoder.Initialize failed — falling back to MJPEG.");
-                        _h264Intended = false;
-                    }
-                    else
-                    {
-                        Debug.LogError("[ViewEncoder] H264Encoder.Initialize failed and TurboJpeg unavailable. Frames will be dropped.");
-                    }
-                }
-                else
-                {
-                    Debug.Log($"[ViewEncoder] H.264 mode: {_cachedWidth}x{_cachedHeight} "
-                             + $"@ {h264BitrateMbps} Mbps, {targetFPS} fps.");
-                }
-            }
+            // Client decides codec — apply the Inspector setting now regardless of discover mode.
+            ApplyCodecMode(codecMode);
 
             _cts            = new CancellationTokenSource();
             _discoverThread = new Thread(DiscoverLoop) { IsBackground = true, Name = "ViewEncoder-Discover" };
@@ -293,11 +306,25 @@ namespace GameViewStream
 
         private void Update()
         {
+            // Watchdog: if GPU readback has been pending for > 3 s, force-reset it.
+            // This handles rare Unity edge cases where AsyncGPUReadback never calls back
+            // (e.g. RenderTexture destroyed, device lost, app focus lost on some platforms).
+            if (_gpuReadbackPending && (Time.unscaledTime - _gpuReadbackRequestTime) > 3f)
+            {
+                // Callback never fired (RT destroyed, device lost, focus lost, etc.).
+                // Just clear the flag so the next Update can issue a fresh request.
+                // Do NOT call WaitAllRequests() here — that blocks the render thread
+                // and causes the GPU readback queue to back up, which is the leak.
+                Debug.LogWarning("[ViewEncoder] GPU readback stuck for 3 s — clearing flag.");
+                _gpuReadbackPending = false;
+            }
+
             if (!_isConnected || _gpuReadbackPending) return;
             if (Time.unscaledTime - _lastCaptureTime < _captureInterval) return;
 
-            _lastCaptureTime    = Time.unscaledTime;
-            _gpuReadbackPending = true;
+            _lastCaptureTime        = Time.unscaledTime;
+            _gpuReadbackPending     = true;
+            _gpuReadbackRequestTime = Time.unscaledTime;
 
             // Render camera to offscreen RT (doesn't affect the scene's main camera)
             RenderTexture prev    = _camera.targetTexture;
@@ -332,7 +359,26 @@ namespace GameViewStream
             _h264Encoder?.Release();
             _h264Encoder?.Dispose();
             _h264Encoder = null;
-            if (_captureRT != null) { _captureRT.Release(); Destroy(_captureRT); }
+            if (_debugH264File != null)
+            {
+                try { _debugH264File.Flush(); _debugH264File.Close(); }
+                catch { /* best-effort */ }
+                _debugH264File = null;
+            }
+            // Drain any in-flight AsyncGPUReadback requests BEFORE releasing the RT.
+            // If the RT is destroyed with requests still referencing it, those requests
+            // can never complete and stay in Unity's internal queue permanently —
+            // accumulating across play sessions and starving the GPU of video decode
+            // resources (causes MF_E_HW_MFT_FAILED_START_STREAMING / 0xC00D4A3E).
+            if (_gpuReadbackPending)
+            {
+                AsyncGPUReadback.WaitAllRequests();
+                _gpuReadbackPending = false;
+            }
+            if (_captureRT != null) { _captureRT.Release(); Destroy(_captureRT); _captureRT = null; }
+            // Drain _rawQueue — return rented ArrayPool buffers.
+            while (_rawQueue.TryDequeue(out var item))
+                System.Buffers.ArrayPool<byte>.Shared.Return(item.raw);
         }
 
         // ── GPU readback callback (main thread) ──────────────────────────────────
@@ -347,10 +393,19 @@ namespace GameViewStream
             if (request.hasError || !_isConnected) return;
 
             // .ToArray() = single memcpy, stays on main thread, NativeArray is valid here
-            byte[] raw = request.GetData<byte>().ToArray();
+            if (_gpuStagingBuffer == null || _gpuStagingBuffer.Length != request.layerCount * request.width * request.height * 4)
+                _gpuStagingBuffer = new byte[request.width * request.height * 4];
+            
+            var data = request.GetData<byte>();
+            data.CopyTo(_gpuStagingBuffer);
+            byte[] raw = System.Buffers.ArrayPool<byte>.Shared.Rent(_gpuStagingBuffer.Length);
+            System.Buffer.BlockCopy(_gpuStagingBuffer, 0, raw, 0, _gpuStagingBuffer.Length);
 
             if (_rawQueue.Count >= rawQueueCapacity)
-                _rawQueue.TryDequeue(out _);
+            {
+                if (_rawQueue.TryDequeue(out var dropped))
+                    System.Buffers.ArrayPool<byte>.Shared.Return(dropped.raw);
+            }
 
             _rawQueue.Enqueue((_frameId++, raw));
             _rawReady.Set();   // wake encode thread immediately
@@ -379,12 +434,20 @@ namespace GameViewStream
                     }
                 }
 
-                if (_cachedUseH264)
-                    EncodeH264(item.id, item.raw);
-                else if (_h264Intended)
-                    { /* H.264 was requested but encoder not ready — drop frame, keepalive will maintain connection */ }
-                else
-                    EncodeJpeg(item.id, item.raw);
+                try
+                {
+                    if (_cachedUseH264)
+                        EncodeH264(item.id, item.raw);
+                    else if (_h264Intended)
+                        { /* H.264 was requested but encoder not ready — drop frame */ }
+                    else
+                        EncodeJpeg(item.id, item.raw);
+                }
+                finally
+                {
+                    // Return the rented RGBA buffer to the pool (was leaked before this fix)
+                    System.Buffers.ArrayPool<byte>.Shared.Return(item.raw);
+                }
             }
         }
 
@@ -414,17 +477,86 @@ namespace GameViewStream
         }
 
         /// <summary>
+        /// Apply a codec mode at runtime — called from <see cref="Start"/>.
+        /// The H264Encoder itself is initialised lazily on the first <see cref="EncodeH264"/> call
+        /// so this method is safe to call from any thread.
+        /// </summary>
+        private void ApplyCodecMode(CodecMode mode)
+        {
+            bool wantsH264 = mode == CodecMode.H264 && H264Encoder.IsAvailable;
+            if (mode == CodecMode.H264 && !wantsH264 && TurboJpeg.IsAvailable)
+                Debug.LogWarning("[ViewEncoder] H.264 requested but H264Encoder is not available on this device — falling back to MJPEG.");
+            _h264Intended  = mode == CodecMode.H264;
+            _cachedUseH264 = wantsH264;
+        }
+
+        /// <summary>
         /// Encode one RGBA32 frame to H.264 via MediaCodec and enqueue the resulting packet(s).
         /// In UDP mode, large NAL sequences are split into fragment datagrams.
         /// </summary>
         private void EncodeH264(uint frameId, byte[] raw)
         {
-            if (_h264Encoder == null) return;
+            // Lazy-initialise encoder on first call. H264Encoder uses AndroidJavaObject which
+            // is safe from background threads in Unity 2021+ (auto JVM attachment).
+            if (_h264Encoder == null)
+            {
+                _h264Encoder = new H264Encoder();
+                if (!_h264Encoder.Initialize(_cachedWidth, _cachedHeight, _cachedH264Bitrate, targetFPS,
+                                              h264IFrameInterval))
+                {
+                    _h264Encoder.Dispose();
+                    _h264Encoder   = null;
+                    _cachedUseH264 = false;
+                    _h264Intended  = false;
+                    Debug.LogWarning("[ViewEncoder] H264Encoder.Initialize failed — switching to MJPEG.");
+                    return; // this frame dropped; next frame will use MJPEG path
+                }
+                Debug.Log($"[ViewEncoder] H.264 encoder active: {_cachedWidth}x{_cachedHeight} "
+                        + $"@ {_cachedH264Bitrate / 1000} kbps, {targetFPS} fps"
+                        + $", iFrameInterval={h264IFrameInterval:F2}s.");
+
+                // Open H.264 dump file if enabled
+                if (debugDumpH264)
+                {
+                    try
+                    {
+                        string path = System.IO.Path.Combine(Application.persistentDataPath, "debug_h264.bin");
+                        _debugH264File = new FileStream(path, FileMode.Create, FileAccess.Write);
+                        _debugH264FrameCount = 0;
+                        Debug.Log($"[ViewEncoder] H.264 dump: {path}");
+                    }
+                    catch (Exception e)
+                    {
+                        Debug.LogWarning($"[ViewEncoder] Cannot open H.264 dump file: {e.Message}");
+                    }
+                }
+            }
 
             byte[] h264 = _h264Encoder.Encode(raw);
 
             // It is normal for MediaCodec to buffer a few frames before producing output.
             if (h264 == null || h264.Length == 0) return;
+
+            // Write raw Annex-B H.264 to dump file for offline verification (ffplay -f h264 file.bin)
+            if (_debugH264File != null)
+            {
+                if (debugDumpMaxFrames <= 0 || _debugH264FrameCount < debugDumpMaxFrames)
+                {
+                    try { _debugH264File.Write(h264, 0, h264.Length); }
+                    catch { /* best-effort */ }
+                    _debugH264FrameCount++;
+                }
+                else if (_debugH264FrameCount == debugDumpMaxFrames)
+                {
+                    _debugH264FrameCount++;
+                    try { _debugH264File.Flush(); _debugH264File.Close(); }
+                    catch { /* best-effort */ }
+                    _debugH264File = null;
+                    Debug.Log($"[ViewEncoder] H.264 dump complete ({debugDumpMaxFrames} frames).");
+                }
+            }
+
+            Interlocked.Add(ref _bwEncoderBytes, h264.Length);
 
             if (_transportMode == TransportMode.UDP)
             {
@@ -473,14 +605,13 @@ namespace GameViewStream
                 {
                     while (!_cts.IsCancellationRequested)
                     {
-                        Debug.Log("[ViewEncoder] Broadcasting discovery probe...");
                         if (DiscoverServer(out string foundAddress, out int foundPort))
                         {
                             _serverEndPoint = new IPEndPoint(IPAddress.Parse(foundAddress), foundPort);
-                            Debug.Log($"[ViewEncoder] Server discovered at {foundAddress}:{foundPort}");
+                            Debug.Log($"[ViewEncoder] Server discovered at {foundAddress}:{foundPort} transport={_transportMode}");
                             break;
                         }
-                        Debug.Log($"[ViewEncoder] No server found — retrying in {discoveryTimeout} ms...");
+                        // No extra log here — DiscoverServer already logs the timeout reason.
                     }
                     if (_cts.IsCancellationRequested) break;
                 }
@@ -493,17 +624,35 @@ namespace GameViewStream
                 Debug.Log($"[ViewEncoder] Transport mode: {_transportMode}, target: {_serverEndPoint}");
 
                 // ── Connect ───────────────────────────────────────────────────────
-                if (_transportMode == TransportMode.TCP)
-                {
+                if (_transportMode == TransportMode.TCP)                {
                     // ── TCP path ──────────────────────────────────────────────────
                     try
                     {
-                        _tcp           = new TcpClient();
-                        _tcp.NoDelay   = true;
+                        _tcp             = new TcpClient();
+                        _tcp.NoDelay     = true;
                         _tcp.SendBufferSize = 2 * 1024 * 1024;
+                        _tcp.SendTimeout    = 5000;   // unblock Write after 5 s
+                        _tcp.ReceiveTimeout = 10000;  // unblock Read after 10 s so recv thread can check liveness
+
+                        // Aggressive OS-level TCP keepalive to detect half-open connections
+                        // caused by WiFi drops, NAT table expiry, etc.
+                        // Uses IOControl(KeepAliveValues) for compatibility with Mono/.NET Standard 2.1.
+                        try
+                        {
+                            _tcp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                            // struct tcp_keepalive { u_long onoff; u_long keepalivetime; u_long keepaliveinterval; }
+                            byte[] keepAlive = new byte[12];
+                            System.BitConverter.GetBytes((uint)1).CopyTo(keepAlive, 0);     // onoff
+                            System.BitConverter.GetBytes((uint)5000).CopyTo(keepAlive, 4);  // 5 s idle before first probe
+                            System.BitConverter.GetBytes((uint)1000).CopyTo(keepAlive, 8);  // 1 s between probes
+                            _tcp.Client.IOControl(IOControlCode.KeepAliveValues, keepAlive, null);
+                        }
+                        catch (Exception) { /* platform may not support IOControl keepalive */ }
+
                         _tcp.Connect(_serverEndPoint);
                         _tcpStream     = _tcp.GetStream();
                         _isConnected   = true;
+                        int gen = Interlocked.Increment(ref _connectionGeneration);
                         Debug.Log($"[ViewEncoder] TCP connected to {_serverEndPoint}.");
 
                         var ep = _serverEndPoint;
@@ -512,12 +661,17 @@ namespace GameViewStream
                         byte[] conn = NetworkProtocol.BuildConnectPacket();
                         lock (_tcpWriteLock) _tcpStream.Write(conn, 0, conn.Length);
 
-                        var recvThread = new Thread(ReceiveServerMessagesTcp)
+                        var recvThread = new Thread(() => ReceiveServerMessagesTcp(gen))
                             { IsBackground = true, Name = "ViewEncoder-Receive" };
                         recvThread.Start();
 
                         while (_isConnected && !_cts.IsCancellationRequested)
                             Thread.Sleep(100);
+
+                        // Wait for the receive thread to exit before we close the socket
+                        // and potentially start a new connection. This prevents the old
+                        // recv thread's _isConnected = false from clobbering the new one.
+                        recvThread.Join(2000);
                     }
                     catch (Exception e)
                     {
@@ -606,7 +760,6 @@ namespace GameViewStream
                         for (int i = 0; i < 4; i++) bc[i] = (byte)(ip[i] | ~mask[i]);
                         var bcAddr = new IPAddress(bc);
                         targets.Add(bcAddr);
-                        Debug.Log($"[ViewEncoder] Discovery: will probe subnet broadcast {bcAddr} (iface: {ni.Name})");
                     }
                 }
             }
@@ -635,15 +788,12 @@ namespace GameViewStream
                     foreach (var target in targets)
                     {
                         udp.Send(probe, probe.Length, new IPEndPoint(target, discoveryPort));
-                        Debug.Log($"[ViewEncoder] Discovery probe sent to {target}:{discoveryPort}");
                     }
 
                     // Wait for the first reply from any server on the LAN
                     IPEndPoint sender = new IPEndPoint(IPAddress.Any, 0);
                     byte[]     data   = udp.Receive(ref sender);
                     string     reply  = Encoding.ASCII.GetString(data);
-
-                    Debug.Log($"[ViewEncoder] Discovery reply from {sender}: '{reply}'");
 
                     if (reply.StartsWith(NetworkProtocol.DiscoveryResponse + ":"))
                     {
@@ -655,7 +805,7 @@ namespace GameViewStream
                             address = sender.Address.ToString();
                             port    = serverTcpPort;
 
-                            // Parse transport mode (defaults to TCP for backward compatibility).
+                            // Parse transport mode (defaults to TCP for backward compat).
                             _transportMode = (parts.Length >= 2 && parts[1] == "udp")
                                 ? TransportMode.UDP
                                 : TransportMode.TCP;
@@ -667,10 +817,9 @@ namespace GameViewStream
                     Debug.LogWarning($"[ViewEncoder] Discovery: unexpected reply format: '{reply}'");
                 }
             }
-            catch (SocketException se)
+            catch (SocketException)
             {
-                // 10060 = WSAETIMEDOUT (receive timed out — normal when no server present)
-                Debug.Log($"[ViewEncoder] Discovery receive timed out (SocketError={se.SocketErrorCode}). No server found this probe.");
+                // Receive timed out — normal when no server is running. Silent.
             }
             catch (Exception e)
             {
@@ -709,15 +858,18 @@ namespace GameViewStream
                                 _pendingAcks[seq] = new ReliablePending
                                     { Packet = wrapped, SentMs = NowMs, Retries = 0 };
                                 _udpSender.Send(wrapped, wrapped.Length);
+                                Interlocked.Add(ref _bwWireBytes, wrapped.Length);
                             }
                             else
                             {
                                 _udpSender.Send(packet, packet.Length);
+                                Interlocked.Add(ref _bwWireBytes, packet.Length);
                             }
                         }
                         else
                         {
                             lock (_tcpWriteLock) _tcpStream.Write(packet, 0, packet.Length);
+                            Interlocked.Add(ref _bwWireBytes, packet.Length);
                         }
                         lastSentMs = NowMs;
                     }
@@ -749,6 +901,19 @@ namespace GameViewStream
                     if (reliableUdp && _transportMode == TransportMode.UDP && _isConnected)
                         RetransmitPending();
 
+                    // Periodic bandwidth log (every 5 s)
+                    long nowBw = NowMs;
+                    long elapsed = nowBw - _bwLastLogMs;
+                    if (_isConnected && elapsed >= 5000)
+                    {
+                        long encBytes  = Interlocked.Exchange(ref _bwEncoderBytes, 0);
+                        long wireBytes = Interlocked.Exchange(ref _bwWireBytes, 0);
+                        _bwLastLogMs = nowBw;
+                        float encKbps  = encBytes  * 8f / elapsed;
+                        float wireKbps = wireBytes * 8f / elapsed;
+                        Debug.Log($"[ViewEncoder] BW: encoder={encKbps:F0} kbps, wire={wireKbps:F0} kbps (target={_cachedH264Bitrate / 1000} kbps)");
+                    }
+
                     _sendReady.Reset();
                     if (_sendQueue.IsEmpty)
                         _sendReady.Wait(reliableUdp
@@ -764,7 +929,7 @@ namespace GameViewStream
         /// Reads the server→client half of the TCP stream for one connection lifetime.
         /// Main job: echo heartbeat pings back so the server's idle clock stays reset.
         /// </summary>
-        private void ReceiveServerMessagesTcp()
+        private void ReceiveServerMessagesTcp(int myGeneration)
         {
             NetworkStream stream = _tcpStream;
             if (stream == null) return;
@@ -775,8 +940,8 @@ namespace GameViewStream
                 while (_isConnected && !_cts.IsCancellationRequested)
                 {
                     // Read fixed-size header (partial reads are normal on TCP)
-                    if (!ReadExact(stream, headerBuf, NetworkProtocol.HeaderSize))
-                        break; // graceful close from server
+                    if (!ReadExact(stream, headerBuf, NetworkProtocol.HeaderSize, _cts))
+                        break; // graceful close from server or cancellation
 
                     if (!NetworkProtocol.TryParseHeader(headerBuf, 0,
                             out NetworkProtocol.PacketType type, out _, out _, out int payloadSize))
@@ -789,10 +954,14 @@ namespace GameViewStream
                     if (payloadSize > 0)
                     {
                         byte[] discard = new byte[payloadSize];
-                        if (!ReadExact(stream, discard, payloadSize)) break;
+                        if (!ReadExact(stream, discard, payloadSize, _cts)) break;
                     }
 
-                    if (type == NetworkProtocol.PacketType.Heartbeat)
+                    if (type == NetworkProtocol.PacketType.RequestKeyFrame)
+                    {
+                        _h264Encoder?.RequestKeyFrame();
+                    }
+                    else if (type == NetworkProtocol.PacketType.Heartbeat)
                     {
                         // Echo pong back so the server's LastReceivedMs is reset.
                         // Any data frame the encoder sends also resets it, so this only matters
@@ -816,7 +985,10 @@ namespace GameViewStream
                     Debug.LogWarning($"[ViewEncoder] Receive error: {e.Message}");
             }
 
-            _isConnected = false; // unblocks DiscoverLoop's sleep loop → triggers reconnect
+            // Only clear _isConnected if we're still the active connection generation.
+            // Otherwise a new connection has already started and we'd clobber its state.
+            if (Volatile.Read(ref _connectionGeneration) == myGeneration)
+                _isConnected = false; // unblocks DiscoverLoop's sleep loop → triggers reconnect
         }
 
         // ── UDP receive ──────────────────────────────────────────────────────────
@@ -851,12 +1023,20 @@ namespace GameViewStream
                                 out var type, out _, out uint ackSeq, out _))
                             continue;
 
-                        if (type == NetworkProtocol.PacketType.Ack)
+                        if (type == NetworkProtocol.PacketType.RequestKeyFrame)
+                        {
+                            _h264Encoder?.RequestKeyFrame();
+                        }
+                        else if (type == NetworkProtocol.PacketType.Ack)
                         {
                             // Server acknowledged a reliable datagram — remove from retransmit buffer.
                             _pendingAcks.TryRemove(ackSeq, out _);
                         }
-                        else if (type == NetworkProtocol.PacketType.Heartbeat)
+                        else if (type == NetworkProtocol.PacketType.RequestKeyFrame)
+                    {
+                        _h264Encoder?.RequestKeyFrame();
+                    }
+                    else if (type == NetworkProtocol.PacketType.Heartbeat)
                         {
                             byte[] pong = NetworkProtocol.BuildHeartbeatPacket();
                             try { udp.Send(pong, pong.Length); } catch { break; }
@@ -889,12 +1069,30 @@ namespace GameViewStream
         /// Returns false if the server closes the connection before all bytes arrive.
         /// TCP Read() only guarantees ≥1 byte — this wrapper handles partial reads.
         /// </summary>
-        private static bool ReadExact(NetworkStream stream, byte[] buffer, int count)
+        /// <summary>
+        /// Reads exactly <paramref name="count"/> bytes.  Returns false on graceful close (Read=0)
+        /// or cancellation.  On ReceiveTimeout it re-enters the loop internally so partial reads
+        /// are preserved, but checks <paramref name="cts"/> so the thread can exit for shutdown.
+        /// </summary>
+        private static bool ReadExact(NetworkStream stream, byte[] buffer, int count,
+                                       CancellationTokenSource cts = null)
         {
             int read = 0;
             while (read < count)
             {
-                int n = stream.Read(buffer, read, count - read);
+                if (cts != null && cts.IsCancellationRequested) return false;
+                int n;
+                try
+                {
+                    n = stream.Read(buffer, read, count - read);
+                }
+                catch (IOException ex) when (ex.InnerException is SocketException se
+                    && se.SocketErrorCode == SocketError.TimedOut)
+                {
+                    // ReceiveTimeout fired — not a real disconnect.
+                    // Re-enter the loop so partial reads are preserved.
+                    continue;
+                }
                 if (n == 0) return false; // graceful close
                 read += n;
             }

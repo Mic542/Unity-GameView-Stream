@@ -42,6 +42,29 @@ extern "C"
     // Release all resources for this decoder.
     GVST_API void        GVST_DeleteDecoder(int id);
 
+    // Signal the decoder to abort its current DrainOutputs loop.
+    // Does NOT acquire decoderLock — safe to call while another thread is in Feed.
+    // The decoder remains usable; call DeleteDecoder later for full cleanup.
+    GVST_API void        GVST_AbortDecoder(int id);
+
     // Returns the last error string for the given decoder (or global if id == -1).
     GVST_API const char* GVST_GetError(int id);
+
+    // Returns diagnostic counters as a human-readable string. Thread-safe.
+    GVST_API const char* GVST_GetStats(int id);
+
+    // ── Zero-copy GPU texture path ──────────────────────────────────────────────
+
+    // Returns a function pointer (as intptr_t) to the Unity render-event callback.
+    // Pass to GL.IssuePluginEvent(ptr, 0) every frame from C# Update().
+    // The callback runs on Unity's render thread and uploads any pending decoded
+    // frames to per-decoder D3D11 textures via UpdateSubresource.
+    GVST_API long long    GVST_GetRenderCallback();
+
+    // Returns the native ID3D11Texture2D* (as long long) for this decoder's
+    // zero-copy output texture.  Returns 0 until the first frame has been
+    // processed by the render callback.  When resolution changes, a new texture
+    // is created and the pointer changes — C# must call Texture2D.UpdateExternalTexture
+    // or recreate the Texture2D when the pointer changes.
+    GVST_API long long    GVST_GetTexturePtr(int id);
 }

@@ -1,0 +1,22 @@
+{
+    "name": "GameViewStream",
+    "rootNamespace": "GameViewStream",
+    "references": [
+        "UniTask"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [
+        {
+            "name": "com.cysharp.unitask",
+            "expression": "",
+            "define": "UNITASK_PRESENT"
+        }
+    ],
+    "noEngineReferences": false
+}

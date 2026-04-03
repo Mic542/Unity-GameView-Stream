@@ -12,6 +12,7 @@
 using System;
 using System.Buffers;
 using System.Runtime.InteropServices;
+using System.Threading;
 using UnityEngine;
 
 namespace GameViewStream
@@ -44,9 +45,23 @@ namespace GameViewStream
             [DllImport(Lib, EntryPoint = "GVST_DeleteDecoder")]
             public static extern void DeleteDecoder(int id);
 
+            [DllImport(Lib, EntryPoint = "GVST_AbortDecoder")]
+            public static extern void AbortDecoder(int id);
+
             [DllImport(Lib, EntryPoint = "GVST_GetError")]
             private static extern IntPtr GetErrorPtr(int id);
             public static string GetError(int id) => Marshal.PtrToStringAnsi(GetErrorPtr(id)) ?? "";
+
+            [DllImport(Lib, EntryPoint = "GVST_GetStats")]
+            private static extern IntPtr GetStatsPtr(int id);
+            public static string GetStats(int id) => Marshal.PtrToStringAnsi(GetStatsPtr(id)) ?? "";
+
+            // ── Zero-copy GPU texture path ──────────────────────────────────────────────
+            [DllImport(Lib, EntryPoint = "GVST_GetRenderCallback")]
+            public static extern IntPtr GetRenderCallback();
+
+            [DllImport(Lib, EntryPoint = "GVST_GetTexturePtr")]
+            public static extern IntPtr GetTexturePtr(int id);
         }
 
         // == Backend availability ======================================================
@@ -82,7 +97,15 @@ namespace GameViewStream
         // == Instance state ============================================================
 
         private int     _id          = -1;
-        private bool    _disposed    = false;
+        private volatile bool _disposed = false;
+
+        // Global lock: GVSTDecoder.dll uses a shared D3D11 device internally.
+        // The D3D11 immediate context is NOT thread-safe, so concurrent GVST_Feed /
+        // GVST_GetFrame calls from different worker threads (decoding different clients)
+        // corrupt GPU state and produce visual artifacts.  Serialising all native calls
+        // through this lock costs nothing at typical frame rates (<1 ms per decode at
+        // 320×240) and fixes the multi-client artifact bug.
+        private static readonly object s_nativeLock = new object();
 
         // Pre-allocated and pinned staging buffer for GVSTDecoder.dll GVST_GetFrame output
         private byte[]   _stageBuf;
@@ -93,13 +116,45 @@ namespace GameViewStream
 
         public int  Width   { get; private set; }
         public int  Height  { get; private set; }
+        public int  DecoderId => _id;
+
+        /// <summary>Returns native diagnostic counters as a string (thread-safe, no lock).</summary>
+        public string GetStats()
+        {
+            if (_id < 0 || _disposed) return "disposed";
+            try { return GvstApi.GetStats(_id); } catch { return "error"; }
+        }
+
         public bool IsReady => _id >= 0 && !_disposed;
+
+        // ── Zero-copy GPU texture path ────────────────────────────────────────────
+        /// <summary>
+        /// Returns the render-event callback pointer to pass to GL.IssuePluginEvent.
+        /// 0 when GVSTDecoder.dll is not loaded.  Safe to call from any thread.
+        /// </summary>
+        public static IntPtr GetRenderCallback()
+        {
+            if (!ProbeBackend()) return IntPtr.Zero;
+            try { return GvstApi.GetRenderCallback(); } catch { return IntPtr.Zero; }
+        }
+
+        /// <summary>
+        /// Returns the native ID3D11Texture2D* for zero-copy rendering.
+        /// Returns IntPtr.Zero until the first frame has been uploaded by the render callback.
+        /// The pointer changes when the decoded resolution changes.
+        /// </summary>
+        public IntPtr GetTexturePtr()
+        {
+            if (_id < 0 || _disposed) return IntPtr.Zero;
+            try { return GvstApi.GetTexturePtr(_id); } catch { return IntPtr.Zero; }
+        }
 
         // == Initialize ================================================================
 
         public bool Initialize(int width, int height)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(H264Decoder));
+            if (_id >= 0) return true; // Already initialized — prevent double-init leak
 
             Width   = width;
             Height  = height;
@@ -110,14 +165,17 @@ namespace GameViewStream
                 return false;
             }
 
-            _id = GvstApi.CreateDecoder();
-            if (_id < 0) { Debug.LogError("[H264Decoder] GVST_CreateDecoder returned -1."); return false; }
-
-            if (!GvstApi.Initialize(_id, width, height))
+            lock (s_nativeLock)
             {
-                Debug.LogError($"[H264Decoder] GVST_Initialize failed: {GvstApi.GetError(_id)}");
-                GvstApi.DeleteDecoder(_id); _id = -1;
-                return false;
+                _id = GvstApi.CreateDecoder();
+                if (_id < 0) { Debug.LogError("[H264Decoder] GVST_CreateDecoder returned -1."); return false; }
+
+                if (!GvstApi.Initialize(_id, width, height))
+                {
+                    Debug.LogError($"[H264Decoder] GVST_Initialize failed: {GvstApi.GetError(_id)}");
+                    GvstApi.DeleteDecoder(_id); _id = -1;
+                    return false;
+                }
             }
 
             // Pin the staging buffer once for the lifetime of this decoder;
@@ -135,22 +193,39 @@ namespace GameViewStream
         /// Returns a rented ArrayPool RGBA32 buffer on success; null when MFT needs more input.
         /// Caller MUST return the buffer to ArrayPool(byte).Shared when done.
         /// </summary>
-        public byte[] Decode(byte[] data, int offset, int length)
+        public bool Feed(byte[] data, int offset, int length)
         {
-            if (!IsReady || data == null || length <= 0) return null;
+            if (!IsReady || data == null || length <= 0) return false;
 
-            GCHandle pin = GCHandle.Alloc(data, GCHandleType.Pinned);
-            try
+            lock (s_nativeLock)
             {
-                IntPtr ptr = new IntPtr(pin.AddrOfPinnedObject().ToInt64() + offset);
-
-                if (!GvstApi.Feed(_id, ptr, length))
+                GCHandle pin = GCHandle.Alloc(data, GCHandleType.Pinned);
+                try
                 {
-                    Debug.LogWarning($"[H264Decoder] GVST_Feed failed: {GvstApi.GetError(_id)}");
-                    return null;
+                    IntPtr ptr = new IntPtr(pin.AddrOfPinnedObject().ToInt64() + offset);
+                    if (!GvstApi.Feed(_id, ptr, length))
+                    {
+                        Debug.LogWarning($"[H264Decoder] GVST_Feed failed: {GvstApi.GetError(_id)}");
+                        return false;
+                    }
                 }
+                finally
+                {
+                    pin.Free();
+                }
+            }
+            return true;
+        }
 
-                int outW, outH;
+        public byte[] GetNextReadyFrame()
+        {
+            if (!IsReady) return null;
+
+            byte[] stageBuf;
+            int outW, outH;
+
+            lock (s_nativeLock)
+            {
                 if (!GvstApi.GetFrame(_id, _stagePin.AddrOfPinnedObject(),
                                      _stageBuf.Length, out outW, out outH))
                 {
@@ -169,39 +244,84 @@ namespace GameViewStream
                     }
                     else
                     {
-                        return null; // MFT still buffering — normal for first few frames
+                        return null; // No frame ready
                     }
                 }
+                stageBuf = _stageBuf;
+            }
 
-                // Actual resolution may differ from initialisation hint if SPS changed
-                int validBytes = outW * outH * 4;
-                byte[] buf = ArrayPool<byte>.Shared.Rent(validBytes);
-                Buffer.BlockCopy(_stageBuf, 0, buf, 0, Math.Min(validBytes, _stageBuf.Length));
-                Width  = outW;
-                Height = outH;
-                return buf;
-            }
-            finally
-            {
-                pin.Free();
-            }
+            // Copy out of lock to improve multi-client concurrency
+            int validBytes = outW * outH * 4;
+            byte[] buf = ArrayPool<byte>.Shared.Rent(validBytes);
+            Buffer.BlockCopy(stageBuf, 0, buf, 0, Math.Min(validBytes, stageBuf.Length));
+            Width  = outW;
+            Height = outH;
+            return buf;
         }
 
+        public byte[] Decode(byte[] data, int offset, int length)
+        {
+            if (Feed(data, offset, length))
+                return GetNextReadyFrame();
+            return null;
+        }
+
+
         // == IDisposable ===============================================================
+
+        /// <summary>
+        /// Signal the native decoder to abort its current output-drain loop.
+        /// Does NOT acquire s_nativeLock — safe to call while a worker thread
+        /// is inside Feed/GetNextReadyFrame.  Call before joining the worker.
+        /// </summary>
+        public void Abort()
+        {
+            if (_id >= 0 && !_disposed)
+            {
+                try { GvstApi.AbortDecoder(_id); } catch { }
+            }
+        }
 
         public void Dispose()
         {
             if (_disposed) return;
-            _disposed = true;
 
-            if (_stagePinned) { _stagePin.Free(); _stagePinned = false; }
-
-            if (_id >= 0)
+            // Use Monitor.TryEnter with a timeout instead of lock(s_nativeLock).
+            // During domain reload, the H264 worker thread may still be alive inside
+            // Feed() holding s_nativeLock (stuck in a native GPU wait).  A plain lock()
+            // would deadlock the main thread → Unity hangs on "Reloading Domain".
+            // With TryEnter, if we can't acquire within 3 s we abandon the decoder
+            // (small native leak) rather than hanging the editor forever.
+            bool lockTaken = false;
+            try
             {
-                GvstApi.DeleteDecoder(_id);
-                _id = -1;
-            }
+                Monitor.TryEnter(s_nativeLock, 3000, ref lockTaken);
+                if (!lockTaken)
+                {
+                    Debug.LogWarning("[H264Decoder] Dispose: couldn't acquire lock in 3 s — abandoning decoder to avoid hang.");
+                    _disposed = true;
+                    return;
+                }
 
+                if (_disposed) return; // double-check inside lock
+                _disposed = true;
+
+                if (_stagePinned)
+                {
+                    _stagePin.Free();
+                    _stagePinned = false;
+                }
+
+                if (_id >= 0)
+                {
+                    GvstApi.DeleteDecoder(_id);
+                    _id = -1;
+                }
+            }
+            finally
+            {
+                if (lockTaken) Monitor.Exit(s_nativeLock);
+            }
         }
     }
 
@@ -212,8 +332,15 @@ namespace GameViewStream
         public bool IsReady  => false;
         public int  Width    { get; private set; }
         public int  Height   { get; private set; }
+        public int  DecoderId => -1;
         public bool Initialize(int w, int h)                           => false;
+        public bool Feed(byte[] d, int o, int l)                       => false;
+        public byte[] GetNextReadyFrame()                              => null;
         public byte[] Decode(byte[] d, int o, int l)                   => null;
+        public string GetStats()                                       => "stub";
+        public static IntPtr GetRenderCallback()                       => IntPtr.Zero;
+        public IntPtr GetTexturePtr()                                  => IntPtr.Zero;
+        public void Abort() { }
         public void Dispose() { }
     }
 #endif

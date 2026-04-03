@@ -1,8 +1,13 @@
 {
     "name": "CRVS.Runtime",
     "rootNamespace": "",
-    "references": [
-        "GUID:4d14b15ded5e3ac4499a81ec3fc340fc"
+    "references": [],
+    "versionDefines": [
+        {
+            "name": "com.cysharp.unitask",
+            "expression": "",
+            "define": "UNITASK_PRESENT"
+        }
     ],
     "includePlatforms": [],
     "excludePlatforms": [],
@@ -11,6 +16,6 @@
     "precompiledReferences": [],
     "autoReferenced": true,
     "defineConstraints": [],
-    "versionDefines": [],
+
     "noEngineReferences": false
 }

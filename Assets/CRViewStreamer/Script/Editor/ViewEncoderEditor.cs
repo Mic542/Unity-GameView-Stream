@@ -52,8 +52,12 @@ namespace GameViewStream
             }
             else // H264
             {
-                EditorGUILayout.PropertyField(Prop("h264BitrateMbps"), new GUIContent("Bitrate (Mbps)"));
-                EditorGUILayout.HelpBox("H.264 encode requires Android device with MediaCodec.\nNo effect in Windows Editor — JPEG is used at runtime.", MessageType.Info);
+                EditorGUILayout.PropertyField(Prop("h264BitrateMbps"),    new GUIContent("Bitrate (Mbps)"));
+                EditorGUILayout.PropertyField(Prop("h264IFrameInterval"), new GUIContent("I-Frame Interval (s)"));
+                EditorGUILayout.HelpBox(
+                    "0 = every frame is I-frame (recommended — no smearing).\n"
+                  + "Values > 0 enable P-frames for better compression but may smear on some devices.",
+                    MessageType.Info);
             }
             EditorGUI.indentLevel--;
 
@@ -79,6 +83,18 @@ namespace GameViewStream
                 "Only applies when the server selects UDP transport mode.\n"
               + "Adds sequence numbers and ACK-based retransmission to prevent packet loss on WiFi.",
                 MessageType.Info);
+
+            // ── Diagnostics ───────────────────────────────────────────────────────
+            Header("Diagnostics");
+            var dumpProp = Prop("debugDumpH264");
+            EditorGUILayout.PropertyField(dumpProp, new GUIContent("Dump H.264 to File"));
+            if (dumpProp.boolValue)
+            {
+                EditorGUI.indentLevel++;
+                EditorGUILayout.PropertyField(Prop("debugDumpMaxFrames"), new GUIContent("Max Frames (0 = unlimited)"));
+                EditorGUI.indentLevel--;
+            }
+
 
             serializedObject.ApplyModifiedProperties();
         }

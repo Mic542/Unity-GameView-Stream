@@ -33,7 +33,7 @@ namespace GameViewStream
 
         // ── State ─────────────────────────────────────────────────────────────
         private AndroidJavaObject _codec;
-        private int  _width, _height, _colorFormat;
+        private int  _width, _height, _colorFormat, _stride, _sliceHeight;
         private byte[] _spsBuffer, _ppsBuffer;
         private bool _ready = false, _disposed = false;
 
@@ -53,13 +53,27 @@ namespace GameViewStream
         public static bool IsAvailable => true;
 
         // ── Initialize ────────────────────────────────────────────────────────
-        public bool Initialize(int width, int height, int bitrateBps, int fps)
+        private float _iFrameIntervalSec;
+
+        /// <summary>
+        /// Initialise the MediaCodec H.264 encoder.
+        /// <paramref name="iFrameIntervalSec"/>: seconds between IDR keyframes.
+        /// 0 = every frame is an I-frame (eliminates P-frame smearing artifacts).
+        /// Fractional values like 0.1 or 0.5 are supported via MediaFormat.setFloat.
+        /// </summary>
+        public bool Initialize(int width, int height, int bitrateBps, int fps,
+                               float iFrameIntervalSec = 0f)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(H264Encoder));
             _width = width; _height = height;
+            _iFrameIntervalSec = iFrameIntervalSec;
 
             try
             {
+                // Ensure this thread is attached to the JVM before any JNI calls.
+                // Initialize() may be called from the encode background thread (lazy init).
+                AndroidJNI.AttachCurrentThread();
+
                 // 1. Create encoder
                 using var mc = new AndroidJavaClass("android.media.MediaCodec");
                 _codec = mc.CallStatic<AndroidJavaObject>("createEncoderByType", "video/avc");
@@ -98,7 +112,7 @@ namespace GameViewStream
 
                 _pts.Restart();
                 _ready = true;
-                Debug.Log($"[H264Encoder] Initialised: {width}x{height} colorFmt={_colorFormat} @ {bitrateBps}bps {fps}fps");
+                Debug.Log($"[H264Encoder] Initialised: {width}x{height} colorFmt={_colorFormat} @ {bitrateBps}bps {fps}fps iFrameInterval={_iFrameIntervalSec:F2}s");
                 return true;
             }
             catch (Exception e)
@@ -122,12 +136,28 @@ namespace GameViewStream
                 using var mfClass = new AndroidJavaClass("android.media.MediaFormat");
                 using var fmt = mfClass.CallStatic<AndroidJavaObject>("createVideoFormat", "video/avc", w, h);
                 fmt.Call("setInteger", "bitrate",          bitrate);
+                fmt.Call("setInteger", "bitrate-mode",     2); // BITRATE_MODE_CBR — strict constant bitrate
                 fmt.Call("setInteger", "frame-rate",       fps);
                 fmt.Call("setInteger", "color-format",     colorFmt);
-                fmt.Call("setInteger", "i-frame-interval", 1);
+                fmt.Call("setInteger", "latency", 0);
+                fmt.Call("setInteger", "priority", 0); // Real-time priority
+                // i-frame-interval: 0 = all I-frames; >0 = seconds between IDRs.
+                // Use setFloat for fractional values (API 25+), setInteger for whole seconds.
+                if (_iFrameIntervalSec <= 0f)
+                    fmt.Call("setInteger", "i-frame-interval", 0);
+                else if (_iFrameIntervalSec == Mathf.Floor(_iFrameIntervalSec))
+                    fmt.Call("setInteger", "i-frame-interval", (int)_iFrameIntervalSec);
+                else
+                    fmt.Call("setFloat", "i-frame-interval", _iFrameIntervalSec);
 
                 _codec.Call("configure", fmt, null, null, CONFIGURE_FLAG_ENCODE);
                 _codec.Call("start");
+                using var inputFmt = _codec.Call<AndroidJavaObject>("getInputFormat");
+                _stride = inputFmt.Call<int>("getInteger", "stride");
+                _sliceHeight = inputFmt.Call<int>("getInteger", "slice-height");
+                if (_stride <= 0) _stride = w;
+                if (_sliceHeight <= 0) _sliceHeight = h;
+                Debug.Log($"[H264Encoder] stride={_stride} sliceHeight={_sliceHeight} (video={w}x{h})");
                 return true;
             }
             catch (Exception e)
@@ -210,9 +240,20 @@ namespace GameViewStream
 
             long ptsUs = _pts.ElapsedMilliseconds * 1000L;
 
-            byte[] yuv = (_colorFormat == COLOR_Planar)
-                ? RgbaToI420(rgbaData, _width, _height)
-                : RgbaToNv12(rgbaData, _width, _height);
+            // MediaCodec requires stride-aligned YUV input.  _stride and _sliceHeight
+            // come from getInputFormat() after configure+start.  On most Android SoCs
+            // stride > width (e.g. 480→512) and sliceHeight > height (e.g. 272→288).
+            // Writing width×height data into a stride×sliceHeight buffer causes the
+            // encoder to read garbage between rows → corrupted chroma → smearing artifacts.
+            int yuvLen = (_colorFormat == COLOR_Planar)
+                ? RgbaToI420Strided(rgbaData, _width, _height, _stride, _sliceHeight, null)
+                : RgbaToNv12Strided(rgbaData, _width, _height, _stride, _sliceHeight, null);
+            
+            byte[] yuv = new byte[yuvLen];
+            if (_colorFormat == COLOR_Planar)
+                RgbaToI420Strided(rgbaData, _width, _height, _stride, _sliceHeight, yuv);
+            else
+                RgbaToNv12Strided(rgbaData, _width, _height, _stride, _sliceHeight, yuv);
 
             // Write YUV into the native ByteBuffer directly — avoids marshaling ~780 KB
             // across the JNI boundary on every frame (which was causing the app freeze).
@@ -286,7 +327,13 @@ namespace GameViewStream
                 bool isConfig   = (flags & BUFFER_FLAG_CODEC_CONFIG) != 0;
                 bool isKeyFrame = (flags & BUFFER_FLAG_SYNC_FRAME)   != 0;
 
-                if (isConfig) { if (chunk != null) ParseSPSPPS(chunk); continue; }
+                if (isConfig) { 
+                    if (chunk != null) { 
+                        ParseSPSPPS(chunk);
+                        ms.Write(chunk, 0, chunk.Length); 
+                    } 
+                    continue; 
+                }
                 if (chunk == null) continue;
 
                 if (isKeyFrame && _spsBuffer != null && _ppsBuffer != null)
@@ -323,34 +370,105 @@ namespace GameViewStream
         private static void WriteNal(Stream s, byte[] nal)
         { s.WriteByte(0); s.WriteByte(0); s.WriteByte(0); s.WriteByte(1); s.Write(nal, 0, nal.Length); }
 
-        // ── YUV conversion ────────────────────────────────────────────────────
-        private static byte[] RgbaToNv12(byte[] rgba, int w, int h)
+        // ── YUV conversion (stride-aware) ────────────────────────────────────
+        // Android MediaCodec expects YUV planes laid out with stride (not width).
+        //   Y  plane: stride × sliceHeight bytes
+        //   UV plane: stride × (sliceHeight/2) bytes (NV12: interleaved UV; I420: separate U then V)
+        // Pixels beyond width/height in each row are padding (zeros).
+        // If output is null, returns required buffer size only.
+
+        private static int RgbaToNv12Strided(byte[] rgba, int w, int h, int stride, int sliceH, byte[] output)
         {
-            int fs = w * h; byte[] o = new byte[fs + fs / 2];
-            int yi = 0, uvi = fs;
-            for (int r = 0; r < h; r++) for (int c = 0; c < w; c++)
+            if (stride  < w) stride  = w;
+            if (sliceH < h) sliceH = h;
+            int yPlaneSize  = stride * sliceH;
+            int uvPlaneSize = stride * (sliceH / 2);
+            int totalSize   = yPlaneSize + uvPlaneSize;
+            if (output == null) return totalSize;
+
+            // Zero the buffer (padding between width and stride, and height and sliceHeight)
+            Array.Clear(output, 0, Math.Min(output.Length, totalSize));
+
+            // Y plane
+            for (int r = 0; r < h; r++)
             {
-                int i = (r*w+c)*4, R = rgba[i]&0xFF, G = rgba[i+1]&0xFF, B = rgba[i+2]&0xFF;
-                o[yi++] = Y(R,G,B);
-                if ((r&1)==0 && (c&1)==0) { o[uvi++]=U(R,G,B); o[uvi++]=V(R,G,B); }
+                int yRow = r * stride;
+                int rgbaRow = r * w * 4;
+                for (int c = 0; c < w; c++)
+                {
+                    int i = rgbaRow + c * 4;
+                    int R = rgba[i] & 0xFF, G = rgba[i + 1] & 0xFF, B = rgba[i + 2] & 0xFF;
+                    output[yRow + c] = Y(R, G, B);
+                }
             }
-            return o;
+
+            // UV plane (interleaved, NV12)
+            int uvBase = yPlaneSize;
+            for (int r = 0; r < h - 1; r += 2)
+            {
+                int uvRow = uvBase + (r / 2) * stride;
+                int rgbaRow = r * w * 4;
+                for (int c = 0; c < w - 1; c += 2)
+                {
+                    int i = rgbaRow + c * 4;
+                    int R = rgba[i] & 0xFF, G = rgba[i + 1] & 0xFF, B = rgba[i + 2] & 0xFF;
+                    output[uvRow + c]     = U(R, G, B);
+                    output[uvRow + c + 1] = V(R, G, B);
+                }
+            }
+
+            return totalSize;
         }
 
-        private static byte[] RgbaToI420(byte[] rgba, int w, int h)
+        private static int RgbaToI420Strided(byte[] rgba, int w, int h, int stride, int sliceH, byte[] output)
         {
-            int fs = w * h; byte[] o = new byte[fs + fs / 2];
-            int yi = 0, ui = fs, vi = fs + fs/4;
-            for (int r = 0; r < h; r++) for (int c = 0; c < w; c++)
+            if (stride  < w) stride  = w;
+            if (sliceH < h) sliceH = h;
+            int yPlaneSize = stride * sliceH;
+            int uPlaneSize = (stride / 2) * (sliceH / 2);
+            int vPlaneSize = uPlaneSize;
+            int totalSize  = yPlaneSize + uPlaneSize + vPlaneSize;
+            if (output == null) return totalSize;
+
+            Array.Clear(output, 0, Math.Min(output.Length, totalSize));
+
+            int halfStride = stride / 2;
+
+            // Y plane
+            for (int r = 0; r < h; r++)
             {
-                int i = (r*w+c)*4, R = rgba[i]&0xFF, G = rgba[i+1]&0xFF, B = rgba[i+2]&0xFF;
-                o[yi++] = Y(R,G,B);
-                if ((r&1)==0 && (c&1)==0) { o[ui++]=U(R,G,B); o[vi++]=V(R,G,B); }
+                int yRow = r * stride;
+                int rgbaRow = r * w * 4;
+                for (int c = 0; c < w; c++)
+                {
+                    int i = rgbaRow + c * 4;
+                    int R = rgba[i] & 0xFF, G = rgba[i + 1] & 0xFF, B = rgba[i + 2] & 0xFF;
+                    output[yRow + c] = Y(R, G, B);
+                }
             }
-            return o;
+
+            // U plane
+            int uBase = yPlaneSize;
+            // V plane
+            int vBase = yPlaneSize + uPlaneSize;
+            for (int r = 0; r < h - 1; r += 2)
+            {
+                int uRow = uBase + (r / 2) * halfStride;
+                int vRow = vBase + (r / 2) * halfStride;
+                int rgbaRow = r * w * 4;
+                for (int c = 0; c < w - 1; c += 2)
+                {
+                    int i = rgbaRow + c * 4;
+                    int R = rgba[i] & 0xFF, G = rgba[i + 1] & 0xFF, B = rgba[i + 2] & 0xFF;
+                    output[uRow + c / 2] = U(R, G, B);
+                    output[vRow + c / 2] = V(R, G, B);
+                }
+            }
+
+            return totalSize;
         }
 
-        private static byte Y(int r,int g,int b) => (byte)Math.Max(0,Math.Min(255,((66*r+129*g+25*b+128)>>8)+16));
+        private static byte Y(int r,int g,int b) => (byte)Math.Max(0,Math.Min(255,((66*r + 129*g + 25*b + 128) >> 8) + 16));
         private static byte U(int r,int g,int b) => (byte)Math.Max(0,Math.Min(255,((-38*r-74*g+112*b+128)>>8)+128));
         private static byte V(int r,int g,int b) => (byte)Math.Max(0,Math.Min(255,((112*r-94*g-18*b+128)>>8)+128));
 
@@ -375,7 +493,7 @@ namespace GameViewStream
     public sealed class H264Encoder : IDisposable
     {
         public static bool IsAvailable => false;
-        public bool   Initialize(int w, int h, int bps, int fps) => false;
+        public bool   Initialize(int w, int h, int bps, int fps, float iFrameIntervalSec = 0f) => false;
         public byte[] Encode(byte[] rgba)                        => null;
         public void   RequestKeyFrame()                           { }
         public void   Release()                                   { }

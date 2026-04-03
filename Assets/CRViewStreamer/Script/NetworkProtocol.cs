@@ -58,7 +58,8 @@ namespace GameViewStream
             H264Frame    = 0x03,  // complete H.264 Annex-B NAL sequence
             Fragment     = 0x04,  // fragmented payload (UDP only); sub-header carries original type
             Heartbeat    = 0x05,  // server→client ping / client→server pong (no payload)
-            Ack          = 0x06,  // server→client: acknowledges a reliable UDP datagram (seqNum in FrameId)
+            Ack          = 0x06,
+            RequestKeyFrame = 0x07,  // server→client: acknowledges a reliable UDP datagram (seqNum in FrameId)
         }
 
         // ── Builder helpers ──────────────────────────────────────────────────────
@@ -257,6 +258,34 @@ namespace GameViewStream
             fragmentIndex  = buffer[offset + 1];
             totalFragments = buffer[offset + 2];
             return totalFragments > 0 && fragmentIndex < totalFragments;
+        }
+
+        /// <summary>
+        /// Checks if an H.264 Annex-B payload starts with an IDR frame or SPS/PPS (KeyFrame).
+        /// Look for 00 00 00 01 followed by NAL type 5 (IDR), 7 (SPS), or 8 (PPS).
+        /// </summary>
+        public static bool IsKeyFrame(byte[] data, int length)
+        {
+            if (data == null || length < 5) return false;
+            // Check first few bytes for Annex-B start code (00 00 00 01 or 00 00 01)
+            // Most encoders put SPS/PPS/IDR at the very start of the packet.
+            for (int i = 0; i <= Math.Min(length - 5, 32); i++)
+            {
+                if (data[i] == 0 && data[i+1] == 0)
+                {
+                    int typePos = -1;
+                    if (data[i+2] == 1) typePos = i + 3;
+                    else if (data[i+2] == 0 && data[i+3] == 1) typePos = i + 4;
+                    
+                    if (typePos != -1 && typePos < length)
+                    {
+                        int type = data[typePos] & 0x1F;
+                        // 5=IDR, 7=SPS, 8=PPS
+                        if (type == 5 || type == 7 || type == 8) return true;
+                    }
+                }
+            }
+            return false;
         }
     }
 }

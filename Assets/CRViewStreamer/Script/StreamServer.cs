@@ -51,6 +51,7 @@ namespace GameViewStream
                + "TCP: reliable, ordered — one thread per client.\n"
                + "UDP: lower latency, best-effort — single receive thread with fragment reassembly.")]
         [SerializeField] private TransportMode transportMode = TransportMode.TCP;
+        public TransportMode Transport => transportMode;
 
         [Tooltip("Port to listen on (TCP or UDP). Must match ViewEncoder.serverPort on every client.")]
         [SerializeField] private int port       = NetworkProtocol.DefaultPort;
@@ -73,7 +74,7 @@ namespace GameViewStream
         [Tooltip("Maximum frames held in the shared queue waiting for decode workers. "
                + "Oldest frames are dropped when this is reached to prevent unbounded memory use "
                + "during long sessions. Raise if workers fall behind on high client counts.")]
-        [SerializeField] private int frameQueueCap = 256;
+        [SerializeField] private int frameQueueCap = 1024;
 
         // ── Events (raised on the main thread via MainThreadDispatcher) ──────────
 
@@ -87,12 +88,19 @@ namespace GameViewStream
         /// <summary>Frames received from all clients, ready to decode on the main thread.</summary>
         public readonly ConcurrentQueue<ClientFrameData> FrameQueue = new ConcurrentQueue<ClientFrameData>();
 
+        /// <summary>Signalled whenever a new frame is enqueued. Decode workers wait on this instead of busy-spinning.</summary>
+        public readonly ManualResetEventSlim FrameReady = new ManualResetEventSlim(false);
+
         /// <summary>Number of clients currently connected.</summary>
         public int ConnectedClientCount => _clients.Count;
 
         // ── Private state ─────────────────────────────────────────────────────────
 
         [SerializeField] private int _connectedClients;
+
+        // Bandwidth measurement: total application-level bytes received from all clients.
+        private long _rxBytes;
+        private float _bwLastLogTime;
 
         // Per-client state ————————————————————————————————————————————————————————
         private sealed class ConnectedClient
@@ -200,6 +208,7 @@ namespace GameViewStream
             else
             {
                 _udpReceiver = new UdpClient(new IPEndPoint(IPAddress.Any, port));
+                _udpReceiver.Client.ReceiveBufferSize = 8 * 1024 * 1024;
                 _udpReceiveThread = new Thread(UdpReceiveLoop)
                     { IsBackground = true, Name = "StreamServer-UdpReceive" };
                 _udpReceiveThread.Start();
@@ -224,6 +233,16 @@ namespace GameViewStream
         private void Update()
         {
             _connectedClients = ConnectedClientCount;
+
+            // Periodic bandwidth log (every 5 s)
+            if (_connectedClients > 0 && Time.unscaledTime - _bwLastLogTime >= 5f)
+            {
+                long rx = Interlocked.Exchange(ref _rxBytes, 0);
+                float elapsed = Time.unscaledTime - _bwLastLogTime;
+                _bwLastLogTime = Time.unscaledTime;
+                float kbps = rx * 8f / (elapsed * 1000f);
+                Debug.Log($"[StreamServer] RX: {kbps:F0} kbps total from {_connectedClients} client(s)");
+            }
         }
 
         private void OnDestroy()
@@ -234,6 +253,7 @@ namespace GameViewStream
             // Stop UDP receiver (if active) — unblocks UdpClient.Receive().
             _udpReceiver?.Close();
             _discoveryUdp?.Close();
+            FrameReady.Set();  // unblock any decode workers waiting on frames
             // Close all client sockets (TCP mode) — unblocks each ReadExact() via IOException.
             foreach (var kv in _clients)
                 if (kv.Value.Tcp != null)
@@ -246,6 +266,9 @@ namespace GameViewStream
                     if (kv.Value.Chunks[i] != null)
                         ArrayPool<byte>.Shared.Return(kv.Value.Chunks[i]);
             _fragmentBuffers.Clear();
+            // Drain FrameQueue — return rented ArrayPool buffers.
+            while (FrameQueue.TryDequeue(out var pending))
+                if (pending.PixelData != null) ArrayPool<byte>.Shared.Return(pending.PixelData);
         }
 
         // ── Accept loop ──────────────────────────────────────────────────────────
@@ -277,7 +300,25 @@ namespace GameViewStream
                 // Disable Nagle's algorithm: real-time video frames must not be coalesced
                 // with subsequent heartbeat packets, which would add up to 200 ms of latency.
                 tcp.NoDelay           = true;
-                tcp.ReceiveBufferSize = 2 * 1024 * 1024; // 2 MB per-client recv buffer
+                tcp.ReceiveBufferSize = 4 * 1024 * 1024; // 4 MB per-client recv buffer
+                tcp.SendTimeout       = 5000;            // prevent indefinite write blocks
+                tcp.ReceiveTimeout    = 10000;           // unblock Read after 10 s so we can check liveness
+
+                // Enable aggressive OS-level TCP keepalive so half-open connections
+                // (e.g. client WiFi drops without FIN) are detected within seconds
+                // rather than the OS default of 2 hours.
+                // Uses IOControl(KeepAliveValues) for compatibility with Mono/.NET Standard 2.1.
+                try
+                {
+                    tcp.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                    // struct tcp_keepalive { u_long onoff; u_long keepalivetime; u_long keepaliveinterval; }
+                    byte[] keepAlive = new byte[12];
+                    System.BitConverter.GetBytes((uint)1).CopyTo(keepAlive, 0);     // onoff
+                    System.BitConverter.GetBytes((uint)5000).CopyTo(keepAlive, 4);  // 5 s idle before first probe
+                    System.BitConverter.GetBytes((uint)1000).CopyTo(keepAlive, 8);  // 1 s between probes
+                    tcp.Client.IOControl(IOControlCode.KeepAliveValues, keepAlive, null);
+                }
+                catch (Exception) { /* platform may not support IOControl keepalive */ }
 
                 ushort id;
                 lock (_idLock) id = _nextClientId++;
@@ -314,7 +355,7 @@ namespace GameViewStream
                 while (!_cts.IsCancellationRequested)
                 {
                     // ── Step 1: read the fixed-size header ───────────────────────────
-                    if (!ReadExact(client.Stream, headerBuf, NetworkProtocol.HeaderSize))
+                    if (!ReadExact(client.Stream, headerBuf, NetworkProtocol.HeaderSize, _cts))
                         break; // connection closed gracefully (Read returned 0)
 
                     if (!NetworkProtocol.TryParseHeader(headerBuf, 0,
@@ -325,13 +366,14 @@ namespace GameViewStream
                     }
 
                     Interlocked.Exchange(ref client.LastReceivedMs, NowMs); // any valid packet counts as liveness
+                    Interlocked.Add(ref _rxBytes, NetworkProtocol.HeaderSize + payloadSize);
 
                     // ── Step 2: read payload (zero for control packets) ──────────────
                     byte[] payload = null;
                     if (payloadSize > 0)
                     {
                         payload = ArrayPool<byte>.Shared.Rent(payloadSize);
-                        if (!ReadExact(client.Stream, payload, payloadSize))
+                        if (!ReadExact(client.Stream, payload, payloadSize, _cts))
                         {
                             ArrayPool<byte>.Shared.Return(payload);
                             break;
@@ -579,6 +621,9 @@ namespace GameViewStream
                         out var type, out _, out uint frameId, out int payloadSize))
                     continue;
 
+                // Track inbound bytes for bandwidth logging (UDP path).
+                Interlocked.Add(ref _rxBytes, data.Length);
+
                 // Immediately acknowledge reliable datagrams so the client
                 // can remove them from its retransmit buffer.
                 if (isReliable)
@@ -732,6 +777,7 @@ namespace GameViewStream
                 PixelData     = payload,
                 PayloadLength = payloadSize,
             });
+            FrameReady.Set();  // wake decode workers
         }
 
         private void RemoveClient(ushort clientId, string reason)
@@ -768,12 +814,30 @@ namespace GameViewStream
         /// Returns <c>false</c> if the connection closes before all bytes are read.
         /// TCP Read() is only guaranteed to return ≥1 byte — this wrapper handles partial reads.
         /// </summary>
-        private static bool ReadExact(NetworkStream stream, byte[] buffer, int count)
+        /// <summary>
+        /// Reads exactly <paramref name="count"/> bytes.  Returns false on graceful close (Read=0).
+        /// On ReceiveTimeout (10 s) it re-enters the Read loop internally, preserving partial data,
+        /// but checks <paramref name="cts"/> so the thread can still exit for shutdown.
+        /// </summary>
+        private static bool ReadExact(NetworkStream stream, byte[] buffer, int count,
+                                       CancellationTokenSource cts = null)
         {
             int read = 0;
             while (read < count)
             {
-                int n = stream.Read(buffer, read, count - read);
+                if (cts != null && cts.IsCancellationRequested) return false;
+                int n;
+                try
+                {
+                    n = stream.Read(buffer, read, count - read);
+                }
+                catch (IOException ex) when (ex.InnerException is SocketException se
+                    && se.SocketErrorCode == SocketError.TimedOut)
+                {
+                    // ReceiveTimeout fired — not a real disconnect.
+                    // Re-enter the loop so partial reads are preserved.
+                    continue;
+                }
                 if (n == 0) return false; // graceful close
                 read += n;
             }
@@ -800,6 +864,23 @@ namespace GameViewStream
             }
             clientId = 0;
             return false;
+        }
+        /// <summary>Sends a raw packet to a specific client (control signaling).</summary>
+        public void SendPacketToClient(ushort clientId, byte[] packet)
+        {
+            if (!_clients.TryGetValue(clientId, out var client)) return;
+            try
+            {
+                if (transportMode == TransportMode.TCP && client.Stream != null)
+                {
+                    lock (client.WriteLock) client.Stream.Write(packet, 0, packet.Length);
+                }
+                else if (transportMode == TransportMode.UDP && _udpReceiver != null && client.UdpEndPoint != null)
+                {
+                    lock (_udpWriteLock) _udpReceiver.Send(packet, packet.Length, client.UdpEndPoint);
+                }
+            }
+            catch { /* client disconnected */ }
         }
     }
 }
